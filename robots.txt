@@ -1,0 +1,3 @@
+User-agent: *
+Disallow: /haven/app-r7k2q9x4/
+Disallow: /app-r7k2q9x4/
