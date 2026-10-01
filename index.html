@@ -31,8 +31,8 @@ html[data-dark="1"]{
   --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25);--okbg:#2C3A2E;--warnbg:#3E3424;--badbg:#45302C;
   --ok:#9CC4A3;--warn:#E0B66C;--bad:#E39A90;color-scheme:dark;
 }
-html[data-dark="1"] [data-theme]{}
-html[data-dark="1"]{--pale:color-mix(in srgb,var(--deep) 26%,#2A2726);--mid:color-mix(in srgb,var(--deep) 45%,#2A2726)}
+/* the theme sits on <body>, so the dark tints must be set on body too, or the light theme tints win and text turns unreadable */
+html[data-dark="1"] body[data-theme],html[data-dark="1"]{--pale:color-mix(in srgb,var(--deep) 26%,#2A2726);--mid:color-mix(in srgb,var(--deep) 45%,#2A2726)}
 html[data-big="1"]{--fs:18.5px}
 html[data-calm="1"] *{transition:none!important;animation:none!important}
 
