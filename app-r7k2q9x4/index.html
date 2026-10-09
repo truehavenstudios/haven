@@ -318,13 +318,16 @@ const E = (() => {
   const dow = s => pd(s).getDay();
 
   // ------------------------------------------------------------ recurrence
-  // item: {start:'YYYY-MM-DD', freq:'once|weekly|biweekly|4weekly|semimonthly|monthly|quarterly|yearly', day2?:15, end?}
+  // item: {start:'YYYY-MM-DD', freq:'once|weekly|biweekly|4weekly|semimonthly|monthly|quarterly|yearly', day2?:15, end?, from?}
+  // start = anchor of the schedule, from = first date it applies (a newer version of an edited bill), end = last date.
+  // second date of a twice-a-month item: 1st → 15th, 15th → last day of the month, 28th or later → 15th
+  const day2 = it => { const d1 = pd(it.start).getDate(); return +it.day2 || (d1 === 1 ? 15 : d1 === 15 ? 31 : d1 >= 28 ? 15 : d1 < 15 ? d1 + 15 : d1 - 15); };
   function occ(it, from, to) {
     const out = [];
     if (!it || !it.start || from > to) return out;
     const end = it.end && it.end < to ? it.end : to;
-    const f = it.freq || "monthly";
-    const push = s => { if (s >= from && s <= end && s >= it.start && out[out.length - 1] !== s) out.push(s); };
+    const f = it.freq || "monthly", lo = it.from && it.from > it.start ? it.from : it.start;
+    const push = s => { if (s >= from && s <= end && s >= lo && out[out.length - 1] !== s) out.push(s); };
     if (f === "once") { push(it.start); return out; }
     if (f === "weekly" || f === "biweekly" || f === "4weekly") {
       const step = f === "weekly" ? 7 : f === "biweekly" ? 14 : 28;
@@ -333,7 +336,7 @@ const E = (() => {
       return out;
     }
     if (f === "semimonthly") {
-      const d1 = pd(it.start).getDate(), d2 = it.day2 || (d1 <= 15 ? d1 + 15 : d1 - 15);
+      const d1 = pd(it.start).getDate(), d2 = day2(it);
       let cur = monthStart(from < it.start ? it.start : from);
       while (cur <= end) {
         const y = pd(cur).getFullYear(), m = pd(cur).getMonth(), L = dim(y, m);
@@ -352,24 +355,38 @@ const E = (() => {
   const perMonth = it => ({ weekly: 52 / 12, biweekly: 26 / 12, "4weekly": 13 / 12, semimonthly: 2, monthly: 1, quarterly: 1 / 3, yearly: 1 / 12, once: 0 })[it.freq || "monthly"] * (+it.amount || 0);
 
   // ------------------------------------------------------------ bills incl. debt minimums
+  // Every schedule that ever applied: the current version of each bill, its older versions (b.versions, kept when the
+  // amount/date/frequency was edited so the past isn't rewritten – same id, so ticks stay with their dates) and debt
+  // minimums (paid-off debts keep their past payments via d.end).
   function allBills(st) {
-    const b = (st.bills || []).filter(x => !x.off);
+    const b = [];
+    (st.bills || []).filter(x => !x.off).forEach(x => {
+      b.push(x);
+      (Array.isArray(x.versions) ? x.versions : []).forEach(v => { if (v && v.start) b.push({ ...x, start: v.start, from: v.from || "", amount: +v.amount, freq: v.freq || x.freq, day2: v.day2, end: v.end, versions: null, old: true }); });
+    });
     (st.debts || []).forEach(d => {
-      if (d.min > 0 && d.balance > 0 && d.dueDay) b.push({ id: "debt:" + d.id, name: d.name, amount: +d.min, freq: "monthly", start: `2000-01-${pad(Math.min(31, d.dueDay))}`, added: d.added, kind: "debt", autopay: !!d.autopay, emoji: "💳" });
+      if (!(d.min > 0 && d.dueDay)) return;
+      const open = d.balance > 0 && !d.deleted;
+      if (!open && !d.end) return;                                              // paid off before Haven kept history
+      b.push({ id: "debt:" + d.id, name: d.name, amount: +d.min, cap: open ? +d.balance : null, amts: d.paidLog || null, end: open ? undefined : d.end, freq: "monthly", start: `2000-01-${pad(Math.min(31, d.dueDay))}`, added: d.added, kind: "debt", autopay: !!d.autopay, emoji: "💳" });
     });
     return b;
   }
+  // bills to list / total up today: current versions only, not stopped or removed, plus open debts
+  const liveBills = (st, today) => allBills(st).filter(b => !b.old && !b.removed && !(b.end && b.end < today) && !(b.kind === "debt" && b.cap === null));
   const key = (id, date) => id + "|" + date;
-  // occurrences with status between from..to
+  // occurrences with status between from..to. o.amount is what that occurrence costs (debts: the logged payment,
+  // or the minimum capped at what's still owed).
   function billOcc(st, from, to) {
     const res = [];
     allBills(st).forEach(b => {
       occ(b, from, to).forEach(date => {
         const k = key(b.id, date), p = (st.paid || {})[k];
-        res.push({ bill: b, date, key: k, paid: !!p, paidAt: p || null, auto: !!b.autopay });
+        const amount = b.amts && b.amts[date] != null ? +b.amts[date] : b.cap != null && !p ? Math.min(+b.amount, b.cap) : +b.amount;
+        res.push({ bill: b, date, key: k, paid: !!p, paidAt: p || null, auto: !!b.autopay, amount });
       });
     });
-    return res.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : b.bill.amount - a.bill.amount);
+    return res.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : b.amount - a.amount);
   }
 
   // ------------------------------------------------------------ income / paydays
@@ -393,7 +410,9 @@ const E = (() => {
 
   // ------------------------------------------------------------ the number
   // Rule of thumb: everything dated BEFORE the last balance check (or on that day and recorded before the check)
-  // is assumed to be in that balance already. Bills dated on/before the check day count as already in it once ticked.
+  // is assumed to be in that balance already. A ticked bill counts by WHEN it was ticked: ticked before the check →
+  // already in the balance; ticked after it → subtracted (the app asks for overdue bills and back-dates the tick
+  // to just before the check if the money had already left).
   function safe(st, today, nowTs) {
     nowTs = nowTs || Date.now();
     const bal = st.balance || { amount: 0, date: today, ts: 0 };
@@ -410,11 +429,11 @@ const E = (() => {
     const dueList = [];
     occs.forEach(o => {
       if (o.bill.added && o.date < o.bill.added) return;                       // before the bill was set up
-      if (o.paid) { if (after(o.date, o.paidAt)) paidSince += +o.bill.amount; return; }
+      if (o.paid) { if (typeof o.paidAt === "number" ? o.paidAt > cTs : o.date > cDate) paidSince += o.amount; return; }
       if (o.date > lastDue) return;                                            // after payday: not due yet
-      if (o.auto && o.date <= today) { if (o.date > cDate) autoSince += +o.bill.amount; return; }  // autopay went out by itself
+      if (o.auto && o.date <= today) { if (o.date > cDate) autoSince += o.amount; return; }  // autopay went out by itself
       if (diff(o.date, cDate) > 31) return;                                    // very old & never ticked: ignore
-      due += +o.bill.amount; dueList.push(o);
+      due += o.amount; dueList.push(o);
     });
     const holds = (st.holds || []).filter(h => h.until > today).reduce((a, h) => a + (+h.amount), 0);
     const money = bal.amount - spentSince + paySince + extraIn - paidSince - autoSince;
@@ -435,7 +454,7 @@ const E = (() => {
       periodStart = lp || addDays(np.date, -(LEN[m.freq] || 30));                // first period: projected start
       const pEnd = addDays(np.date, -1), pdays = Math.max(1, diff(periodStart, np.date));
       const pin = lp ? payOcc(st, periodStart, pEnd).reduce((a, p) => a + p.amount, 0) : +m.amount;
-      const pout = billOcc(st, periodStart, pEnd).filter(o => !(o.bill.added && o.date < o.bill.added && lp)).reduce((a, o) => a + (+o.bill.amount), 0);
+      const pout = billOcc(st, periodStart, pEnd).filter(o => !(o.bill.added && o.date < o.bill.added && lp)).reduce((a, o) => a + o.amount, 0);
       const moved = (st.moneyIn || []).filter(x => x.transfer && x.date >= periodStart && x.date <= pEnd).reduce((a, x) => a - (+x.amount), 0);
       plan = Math.max(0, pin - pout - moved) / pdays;
       if (!lp) periodStart = null;                                              // no payday card / rescue before the first payday
@@ -465,7 +484,7 @@ const E = (() => {
     for (let i = 0; i < Math.min(n, pays.length - 1); i++) {
       const a = pays[i], b = addDays(pays[i + 1], -1);
       const inn = payOcc(st, a, b).reduce((s, p) => s + p.amount, 0);
-      const out = billOcc(st, a, b).filter(o => !o.paid).reduce((s, o) => s + (+o.bill.amount), 0);
+      const out = billOcc(st, a, b).filter(o => !o.paid).reduce((s, o) => s + o.amount, 0);
       res.push({ from: a, to: b, inn, out, net: inn - out });
     }
     return res;
@@ -496,12 +515,13 @@ const E = (() => {
   }
 
   // ------------------------------------------------------------ goals pace
+  // pace = what went in minus what came out over the last 90 days (the starting "already saved" amount isn't a deposit)
   function goalPace(g, today) {
     const left = Math.max(0, g.target - g.saved);
-    const hist = (g.history || []).filter(h => diff(h.date, today) <= 90 && h.amount > 0);
+    const hist = (g.history || []).filter(h => h && !h.start && diff(h.date, today) <= 90 && +h.amount);
     const first = hist.length ? hist.reduce((a, h) => h.date < a ? h.date : a, today) : today;
     const span = Math.max(30, diff(first, today));
-    const rate = hist.reduce((s, h) => s + h.amount, 0) / span * 30.4;   // per month
+    const rate = Math.max(0, hist.reduce((s, h) => s + (+h.amount), 0)) / span * 30.4;   // per month
     const monthly = +g.monthly || rate;
     const months = left <= 0 ? 0 : monthly > 0 ? Math.ceil(left / monthly) : Infinity;
     let perMonthToDate = null;
@@ -509,7 +529,7 @@ const E = (() => {
     return { left, monthly, months, rate, perMonthToDate, finish: months === Infinity ? null : addMonths(today, months) };
   }
 
-  return { pad, ds, pd, addDays, diff, dim, ym, addMonths, monthStart, monthEnd, dow, occ, perMonth, allBills, billOcc, nextPayday, lastPayday, payOcc, mainIncome, safe, lookAhead, debtPlan, goalPace };
+  return { pad, ds, pd, addDays, diff, dim, ym, addMonths, monthStart, monthEnd, dow, occ, day2, perMonth, allBills, liveBills, billOcc, nextPayday, lastPayday, payOcc, mainIncome, safe, lookAhead, debtPlan, goalPace };
 })();
 if (typeof module !== "undefined") module.exports = E;
 
@@ -521,7 +541,7 @@ window.HAVEN_SAMPLE = function () {
   let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
   const nowTs = window.HAVEN_NOW || Date.now();
   const s = {
-    v: 1, setup: true, created: ago(60),
+    v: 2, setup: true, created: ago(60),
     settings: { name: "Maya", currency: "USD", theme: "Blush", dark: "auto", big: false, calm: false, weekStart: 1, cool: 48, debtMethod: "avalanche", debtExtra: 0,
       quick: [{ label: "Coffee", emoji: "☕", amount: 5, cat: "coffee" }, { label: "Lunch", emoji: "🥗", amount: 12, cat: "eating" }, { label: "Bus", emoji: "🚌", amount: 3, cat: "transport" }] },
     accounts: [{ id: "a1", name: "Checking", amount: 1046.82 }, { id: "a2", name: "Cash", amount: 40 }],
@@ -533,11 +553,13 @@ window.HAVEN_SAMPLE = function () {
       { id: "b2", name: "Phone", emoji: "📱", amount: 45, freq: "monthly", start: "2025-01-" + E.addDays(t, 1).slice(8), kind: "bill", added: ago(60) },
       { id: "b3", name: "Internet", emoji: "🌐", amount: 55, freq: "monthly", start: "2025-01-14", kind: "bill", added: ago(60) },
       { id: "b4", name: "Electricity", emoji: "⚡", amount: 84, freq: "monthly", start: "2025-01-20", kind: "bill", added: ago(60) },
-      { id: "b5", name: "Netflix", emoji: "📺", amount: 15.49, freq: "monthly", start: "2025-01-06", kind: "sub", autopay: true, added: ago(60) },
+      { id: "b5", name: "Netflix", emoji: "📺", amount: 15.49, freq: "monthly", start: "2025-01-06", kind: "sub", autopay: true, added: ago(60), priceFrom: 13.99, priceAt: ago(20) },
       { id: "b6", name: "Spotify", emoji: "🎵", amount: 11.99, freq: "monthly", start: "2025-01-22", kind: "sub", autopay: true, added: ago(60) },
       { id: "b7", name: "Gym", emoji: "🏋️", amount: 29, freq: "monthly", start: "2025-01-03", kind: "sub", autopay: true, added: ago(60) },
       { id: "b8", name: "Car insurance", emoji: "🛡️", amount: 118, freq: "monthly", start: "2025-01-25", kind: "bill", added: ago(60) },
       { id: "b9", name: "iCloud", emoji: "☁️", amount: 2.99, freq: "monthly", start: "2025-01-12", kind: "sub", autopay: true, added: ago(60) },
+      { id: "b11", name: "Amazon Prime", emoji: "📦", amount: 89, freq: "yearly", start: "2025-" + E.addDays(t, 40).slice(5), kind: "sub", added: ago(60), cancelBy: E.addDays(t, 12) },
+      { id: "b12", name: "Headspace", emoji: "🧘", amount: 12.99, freq: "monthly", start: E.addDays(t, 8), kind: "sub", added: ago(5) },
       { id: "b10", name: "Savings transfer", emoji: "🏦", amount: 100, freq: "monthly", start: "2025-01-16", kind: "save", autopay: true, added: ago(60) }
     ],
     paid: {}, expenses: [], cats: DEFAULT_CATS.map(c => ({ ...c })),
@@ -604,11 +626,11 @@ const DEFAULT_QUICK = [{ label: "Coffee", emoji: "☕", amount: 5, cat: "coffee"
 
 function blank() {
   return {
-    v: 1, setup: false, created: today(),
+    v: 2, setup: false, created: today(),
     settings: { name: "", currency: "USD", theme: "Blush", dark: "auto", big: false, calm: false, smooth: true, weekStart: 1, cool: 48, quick: DEFAULT_QUICK.map(q => ({ ...q })) },
     accounts: [{ id: uid(), name: "Checking", amount: 0 }], balance: { amount: 0, date: today(), ts: 0 },
     income: [], moneyIn: [], bills: [], paid: {}, expenses: [], cats: DEFAULT_CATS.map(c => ({ ...c })),
-    goals: [], challenges: [], debts: [], wish: [], remember: [], holds: [], kept: 0, rescued: 0, nospend: {}, milestones: {}, minute: {}, ritual: {}, cushionAck: {}, lastOpen: today()
+    goals: [], challenges: [], debts: [], wish: [], remember: [], holds: [], kept: 0, rescued: 0, nospend: {}, milestones: {}, minute: {}, ritual: {}, cushionAck: {}, cushionSpread: {}, goalXfer: {}, lastOpen: today()
   };
 }
 let loadProblem = "";
@@ -621,11 +643,12 @@ function load() {
   try { return migrate(JSON.parse(raw)); }
   catch (e) {
     try { localStorage.setItem(KEY + ".broken-" + Date.now(), raw); } catch (_) { }
-    loadProblem = "Haven couldn't read your saved data, so it started fresh. A copy was kept – restore a backup in Settings.";
+    loadProblem = "Haven couldn't read the data saved on this device. If you have a backup file, choose “Restore from a backup” below to bring everything back.";
     return blank();
   }
 }
-// make any stored or restored object safe to use: right types everywhere, unknown junk dropped
+// make any stored or restored object safe to use: right types for every known key. Keys this version doesn't know
+// (added by a newer version, or by a feature like "spread it over my days") are kept exactly as they are.
 function migrate(s) {
   if (!s || typeof s !== "object" || Array.isArray(s)) throw new Error("not a Haven file");
   const b = blank(), out = {};
@@ -644,6 +667,15 @@ function migrate(s) {
   out.bills = out.bills.filter(x => typeof x.start === "string" && isFinite(+x.amount));
   out.income = out.income.filter(x => typeof x.start === "string" && isFinite(+x.amount));
   for (const k of ["lastBackup", "created", "lastOpen"]) if (s[k] && typeof s[k] === "string") out[k] = s[k];
+  for (const k in s) if (!(k in b) && !(k in out)) out[k] = s[k];
+  if (!out.cats.some(c => c.id === "other")) out.cats.push({ ...DEFAULT_CATS.find(c => c.id === "other") });
+  // v1 → v2: ticks now count by when they were made. A bill dated up to the last balance check but ticked after it used
+  // to count as "already in that balance" – keep that meaning for ticks made before this update, so no number jumps.
+  if (!(+s.v >= 2)) {
+    const bd = out.balance.date, bts = +out.balance.ts || 0;
+    if (bts && typeof bd === "string") for (const k in out.paid) { const p = out.paid[k], d = k.split("|").pop(); if (typeof p === "number" && d <= bd && p > bts) out.paid[k] = bts - 1; }
+    out.v = 2;
+  }
   return out;
 }
 let saveT = null;
@@ -664,7 +696,8 @@ function fmt(v, o = {}) {
 const fmt0 = v => fmt(Math.round(v), { cents: false });
 function symbol() { try { return new Intl.NumberFormat(undefined, { style: "currency", currency: cur() }).formatToParts(0).find(p => p.type === "currency").value; } catch (e) { return cur(); } }
 function bigNum(v) {
-  const neg = v < 0, a = Math.abs(v), whole = Math.floor(a + 1e-9), ct = Math.round((a - whole) * 100) % 100;
+  const dg = curDigits() ? 100 : 1, r = Math.round((+v || 0) * dg) / dg;          // round to what's shown first: 12.996 → 13.00
+  const neg = r < 0, a = Math.abs(r), whole = Math.floor(a + 1e-9), ct = Math.round((a - whole) * 100) % 100;
   const w = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(curDigits() ? whole : Math.round(a));
   return `<span class="big num ${neg ? "neg" : ""}"><span class="cur">${neg ? "−" : ""}${esc(symbol())}</span>${w}${curDigits() ? `<span class="ct">.${String(ct).padStart(2, "0")}</span>` : ""}</span>`;
 }
@@ -682,6 +715,8 @@ function rel(s) {
 }
 function dateBox(s, cls = "") { const d = E.pd(s); return `<div class="date ${cls}"><b>${d.getDate()}</b><span>${MON[d.getMonth()]}</span></div>`; }
 const FREQ = { once: "one time", weekly: "every week", biweekly: "every 2 weeks", "4weekly": "every 4 weeks", semimonthly: "twice a month", monthly: "every month", quarterly: "every 3 months", yearly: "every year" };
+// a bill that's still running today (not paused, removed or stopped before today)
+const isLive = b => !b.off && !b.removed && !(b.end && b.end < today());
 function catOf(id) { return S.cats.find(c => c.id === id) || { id: "other", name: "Other", emoji: "✨", color: "var(--c8)" }; }
 function greet() { const h = new Date(now()).getHours(); return h < 5 ? "Hello, night owl" : h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening"; }
 
@@ -863,13 +898,13 @@ function nextStep(s) {
   const ready = S.wish.filter(w => !w.done && now() - w.ts >= (S.settings.cool || 48) * 36e5);
   const soon = E.billOcc(S, t, E.addDays(t, 1)).filter(o => !o.paid && !o.auto);
   if (!S.balance.ts) { ico = "wallet"; title = "Tell Haven what's in your bank"; txt = "One number – the money in your everyday account(s). Haven does the rest."; btn = `<button class="btn pri sm" data-act="check">Add my balance</button>`; }
-  else if (over.length) { const o = over[0]; ico = "bill"; title = `Did ${esc(o.bill.name)} go out?`; txt = `It was due ${rel(o.date)} (${fmt(o.bill.amount)}). Tick it so your number stays right.`; btn = `<button class="btn pri sm" data-act="pay" data-k="${esc(o.key)}">Yes, it's paid</button><button class="btn sm" href="#/bills" data-act="goto" data-r="bills">See bills</button>`; }
+  else if (over.length) { const o = over[0]; ico = "bill"; title = `Did ${esc(o.bill.name)} go out?`; txt = `It was due ${rel(o.date)} (${fmt(o.amount)}). Tick it so your number stays right.`; btn = `<button class="btn pri sm" data-act="pay" data-k="${esc(o.key)}">Yes, it's paid</button><button class="btn sm" href="#/bills" data-act="goto" data-r="bills">See bills</button>`; }
   else if (s.fresh === "old" && !soon.length) { ico = "wallet"; title = "Quick balance check?"; txt = `It's been ${s.age} days. No catching up needed – tick any bills that went out, then tell Haven today's balance.`; btn = `<button class="btn pri sm" data-act="minute">Start the money minute</button>`; }
   else if (remDue().length) { const r = remDue()[0], T = RT[r.type] || RT.other, d = E.diff(t, r.date); ico = "bell"; title = `${T[1]}: ${esc(r.name)}`; txt = `${d < 0 ? "Was due " + rel(r.date) : "Due " + rel(r.date)}${r.amount ? " · " + fmt(r.amount) : ""}. Sort it now and it's off your mind.`; btn = `<button class="btn pri sm" data-act="remDone" data-id="${r.id}">${T[2]}</button><button class="btn sm" data-act="goto" data-r="remember">Open list</button>`; }
   else if (ready.length) { ico = "pause"; title = `Still want ${esc(ready[0].name)}?`; txt = `The cool-off is over. Decide now – both answers are fine.`; btn = `<button class="btn pri sm" data-act="goto" data-r="wish">Decide</button>`; }
   else if (!DEMO && S.expenses.length >= 15 && (!S.lastBackup || E.diff(S.lastBackup, t) > 30)) { ico = "down"; title = "Time for a little backup"; txt = "Your data lives only on this device. One tap saves a copy you can keep in Files, Drive or your email."; btn = `<button class="btn pri sm" data-act="backup">Download backup</button>`; }
   else if (cancelSoon().length) { const b = cancelSoon()[0], d = E.diff(t, b.cancelBy); ico = "bell"; title = `Cancel ${esc(b.name)} by ${d === 0 ? "today" : dshort(b.cancelBy)}?`; txt = `Your cancel-by date is ${d === 0 ? "today" : "in " + d + " day" + (d > 1 ? "s" : "")}. Still using it? Then you're fine – if not, cancel now.`; btn = `<button class="btn pri sm" data-act="goto" data-r="subs">Open subscriptions</button>`; }
-  else if (soon.length) { ico = "bell"; title = `${esc(soon[0].bill.name)} is due ${rel(soon[0].date)}`; txt = `${fmt(soon[0].bill.amount)} – already held back from your number. Tick it once it's paid.`; btn = `<button class="btn sm" data-act="pay" data-k="${esc(soon[0].key)}">Mark paid</button>`; }
+  else if (soon.length) { ico = "bell"; title = `${esc(soon[0].bill.name)} is due ${rel(soon[0].date)}`; txt = `${fmt(soon[0].amount)} – already held back from your number. Tick it once it's paid.`; btn = `<button class="btn sm" data-act="pay" data-k="${esc(soon[0].key)}">Mark paid</button>`; }
   return `<div class="card next" style="order:2"><div class="ico">${ic(ico)}</div><div class="grow"><div class="caps" style="margin-bottom:3px">One thing right now</div><h3>${title}</h3><div class="sub" style="margin-top:3px">${txt}</div>${btn ? `<div class="row wrap" style="margin-top:12px">${btn}</div>` : ""}</div></div>`;
 }
 function minuteCard() {
@@ -900,7 +935,7 @@ function billRow(o, compact) {
   const cls = o.paid || (o.auto && o.date <= t) ? "ok" : late ? "bad" : d <= 3 ? "warn" : "";
   const status = o.paid ? `<span class="badge ok">paid</span>` : o.auto && o.date <= t ? `<span class="badge ok">autopay</span>` : late ? `<span class="badge bad">overdue</span>` : `<span class="badge ${d <= 3 ? "warn" : ""}">${d === 0 ? "due today" : d === 1 ? "due tomorrow" : "due " + rel(o.date)}</span>`;
   const isDebt = o.bill.id.startsWith("debt:");
-  return `<div class="item">${dateBox(o.date, cls)}<div class="grow"><b class="${o.paid ? "done" : ""}">${o.bill.emoji ? o.bill.emoji + " " : ""}${esc(o.bill.name)}</b><div class="row wrap tiny muted" style="gap:6px;margin-top:2px">${status}<span>${FREQ[o.bill.freq] || ""}${o.bill.autopay ? " · autopay" : ""}</span></div></div><span class="amt">${fmt(o.bill.amount)}</span>
+  return `<div class="item">${dateBox(o.date, cls)}<div class="grow"><b class="${o.paid ? "done" : ""}">${o.bill.emoji ? o.bill.emoji + " " : ""}${esc(o.bill.name)}</b><div class="row wrap tiny muted" style="gap:6px;margin-top:2px">${status}<span>${FREQ[o.bill.freq] || ""}${o.bill.autopay ? " · autopay" : ""}</span></div></div><span class="amt">${fmt(o.amount)}</span>
    <button class="check ${o.paid ? "on" : ""}" data-act="pay" data-k="${esc(o.key)}" aria-label="Mark paid">${ic("check")}</button>${compact || isDebt ? "" : `<button class="iconbtn" data-act="editBill" data-id="${o.bill.id}" aria-label="Edit ${esc(o.bill.name)}">${ic("edit")}</button>`}</div>`;
 }
 function expRow(e) {
@@ -914,7 +949,7 @@ function vMonth() {
   const first = E.monthStart(m), last = E.monthEnd(m);
   const ws = S.settings.weekStart, lead = (E.dow(first) - ws + 7) % 7;
   const start = E.addDays(first, -lead), cells = Math.ceil((lead + E.diff(first, last) + 1) / 7) * 7;
-  const bills = E.billOcc(S, start, E.addDays(start, cells)), pays = E.payOcc(S, start, E.addDays(start, cells));
+  const bills = E.billOcc(S, start, E.addDays(start, cells)).filter(o => !(o.bill.added && o.date < o.bill.added)), pays = E.payOcc(S, start, E.addDays(start, cells));
   const spentBy = {}; S.expenses.forEach(e => { if (+e.amount > 0) spentBy[e.date] = (spentBy[e.date] || 0) + (+e.amount); });
   let html = "";
   for (let i = 0; i < 7; i++) html += `<div class="dow">${DOW[(i + ws) % 7]}</div>`;
@@ -927,7 +962,7 @@ function vMonth() {
   const inMonth = d => d >= first && d <= last;
   const spent = S.expenses.filter(e => inMonth(e.date)).reduce((a, e) => a + (+e.amount), 0);
   const inc = pays.filter(p => inMonth(p.date)).reduce((a, p) => a + p.amount, 0) + S.moneyIn.filter(x => inMonth(x.date) && !x.transfer).reduce((a, x) => a + (+x.amount), 0);
-  const bsum = bills.filter(b => inMonth(b.date)).reduce((a, b) => a + (+b.bill.amount), 0);
+  const bsum = bills.filter(b => inMonth(b.date)).reduce((a, b) => a + b.amount, 0);
   const ns = Object.keys(S.nospend).filter(d => S.nospend[d] && inMonth(d)).length;
   return pageTop(`${MONTHS[d0.getMonth()]} ${d0.getFullYear()}`, "The month", `<div class="seg"><button data-act="mon" data-n="-1" aria-label="Previous month">${ic("left").replace("<svg", '<svg width="16" height="16"')}</button><button data-act="mon" data-n="0" class="${E.ym(m) === E.ym(t) ? "on" : ""}">Today</button><button data-act="mon" data-n="1" aria-label="Next month">${ic("right").replace("<svg", '<svg width="16" height="16"')}</button></div>`)
     + `<div class="stats" style="margin-bottom:18px"><div class="stat ok"><span class="caps">Money in</span><b class="num">${fmt0(inc)}</b></div><div class="stat"><span class="caps">Bills</span><b class="num">${fmt0(bsum)}</b></div><div class="stat p"><span class="caps">Everyday spending</span><b class="num">${fmt0(spent)}</b></div><div class="stat warn"><span class="caps">No-spend days</span><b>${ns} ★</b></div></div>
@@ -938,15 +973,16 @@ function vMonth() {
 function vBills() {
   const t = today(), s = E.safe(S, t, now());
   const occ = E.billOcc(S, E.addDays(t, -31), E.addDays(t, 31)).filter(o => !(o.bill.added && o.date < o.bill.added)).filter(o => o.date >= t || (!o.paid && !o.auto) || (o.paid && E.diff(o.date, t) <= 7));
-  const paidMonth = E.billOcc(S, E.monthStart(t), t).filter(o => o.paid || o.auto).reduce((a, o) => a + (+o.bill.amount), 0);
-  const allB = E.allBills(S), monthly = allB.reduce((a, b) => a + E.perMonth(b), 0);
-  const subs = S.bills.filter(b => b.kind === "sub" && !b.off), subM = subs.reduce((a, b) => a + E.perMonth(b), 0);
+  const paidMonth = E.billOcc(S, E.monthStart(t), t).filter(o => (o.paid || o.auto) && !(o.bill.added && o.date < o.bill.added)).reduce((a, o) => a + o.amount, 0);
+  const allB = E.liveBills(S, t), monthly = allB.reduce((a, b) => a + E.perMonth(b), 0);
+  const stopped = S.bills.filter(b => !b.off && !b.removed && b.end && b.end < t);
+  const subs = S.bills.filter(b => b.kind === "sub" && isLive(b)), subM = subs.reduce((a, b) => a + E.perMonth(b), 0);
   const maxSub = Math.max(1, ...subs.map(b => E.perMonth(b) * 12));
   const waiting = s.dueList.filter(o => o.date < t).length;
   return pageTop("Every bill, in one place", "Bills", `<button class="btn" data-act="detective">🔎 Find forgotten subscriptions</button><button class="btn hide-m" data-act="ics">${ic("cal")} Add to my calendar</button><button class="btn pri" data-act="newBill">${ic("plus")} Add a bill</button>`)
     + `<div class="stats" style="margin-bottom:18px"><div class="stat warn"><span class="caps">Before your next payday</span><b class="num">${fmt(s.due)}</b></div><div class="stat ${waiting ? "bad" : ""}"><span class="caps">Waiting to be ticked</span><b>${waiting}</b></div><div class="stat ok"><span class="caps">Next payday</span><b>${s.payday.none ? "–" : dshort(s.until)}</b></div><div class="stat p"><span class="caps">Paid this month</span><b class="num">${fmt0(paidMonth)}</b></div></div>
     <div class="grid g2"><div class="col"><div class="card"><div class="cardhead"><h2>Soonest first</h2><span class="tiny muted">next 31 days</span></div>${occ.length ? `<div class="list">${occ.map(o => billRow(o)).join("")}</div>` : `<div class="empty">No bills yet. Add rent, phone, streaming… once, and Haven repeats them for you.</div>`}</div></div>
-    <div class="col"><div class="card"><div class="cardhead"><h2>All your bills</h2><span class="muted small">${fmt0(monthly)} / month</span></div>${allB.length ? `<div class="list">${allB.map(b => `<div class="item"><div class="emo">${b.emoji || "🧾"}</div><div class="grow"><b>${esc(b.name)}</b><div class="tiny muted">${FREQ[b.freq]}${b.kind === "debt" ? " · debt minimum" : b.kind === "sub" ? " · subscription" : b.kind === "save" ? " · savings transfer" : ""}</div></div><span class="amt">${fmt(b.amount)}</span>${b.kind === "debt" ? "" : `<button class="iconbtn" data-act="editBill" data-id="${b.id}" aria-label="Edit ${esc(b.name)}">${ic("edit")}</button>`}</div>`).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`}</div>
+    <div class="col"><div class="card"><div class="cardhead"><h2>All your bills</h2><span class="muted small">${fmt0(monthly)} / month</span></div>${allB.length ? `<div class="list">${allB.map(b => `<div class="item"><div class="emo">${b.emoji || "🧾"}</div><div class="grow"><b>${esc(b.name)}</b><div class="tiny muted">${FREQ[b.freq]}${b.kind === "debt" ? " · debt minimum" : b.kind === "sub" ? " · subscription" : b.kind === "save" ? " · savings transfer" + (b.goal && S.goals.find(g => g.id === b.goal) ? " → " + esc(S.goals.find(g => g.id === b.goal).name) : "") : ""}${b.end ? " · last one " + dshort(b.end) : ""}</div></div><span class="amt">${fmt(b.amount)}</span>${b.kind === "debt" ? "" : `<button class="iconbtn" data-act="editBill" data-id="${b.id}" aria-label="Edit ${esc(b.name)}">${ic("edit")}</button>`}</div>`).join("")}</div>` : `<div class="empty">Nothing here yet.</div>`}${stopped.length ? `<div class="caps" style="margin:14px 0 4px">Stopped</div><div class="list">${stopped.map(b => `<div class="item" style="opacity:.7"><div class="emo">${b.emoji || "🧾"}</div><div class="grow"><b>${esc(b.name)}</b><div class="tiny muted">last one ${dshort(b.end)}</div></div><span class="amt">${fmt(b.amount)}</span><button class="iconbtn" data-act="editBill" data-id="${b.id}" aria-label="Edit ${esc(b.name)}">${ic("edit")}</button></div>`).join("")}</div>` : ""}</div>
     <div class="card"><div class="cardhead"><h2>Subscription radar</h2><span class="badge">${subs.length} subscriptions</span></div><div class="stats" style="margin-bottom:12px"><div class="stat p"><span class="caps">A month</span><b class="num">${fmt(subM)}</b></div><div class="stat ok"><span class="caps">A year</span><b class="num">${fmt(subM * 12)}</b></div></div>
     ${subs.length ? subs.map(b => `<div style="margin:9px 0"><div class="row sb small"><span>${b.emoji || "📺"} ${esc(b.name)}</span><span class="num muted">${fmt(E.perMonth(b) * 12)} a year</span></div><div class="bar" style="margin-top:5px"><i style="width:${E.perMonth(b) * 12 / maxSub * 100}%;background:var(--c6)"></i></div></div>`).join("") + `<div class="row" style="margin-top:10px"><button class="link" data-act="goto" data-r="subs">Open all subscriptions →</button></div>` : `<div class="sub">Mark a bill as “subscription” to see it here.</div>`}</div></div></div>`;
 }
@@ -976,7 +1012,7 @@ function vPay() {
   const pays = E.payOcc(S, t, E.addDays(t, 60)).slice(0, 6);
   const periods = la.map(p => { const bills = E.billOcc(S, p.from, p.to).filter(o => !o.paid); return { ...p, bills }; });
   return pageTop("Budget by paycheck", "Paychecks", `<button class="btn" data-act="moneyIn">${ic("down")} Extra money in</button><button class="btn pri" data-act="newIncome">${ic("plus")} Add income</button>`)
-    + `<div class="grid g2"><div class="col"><div class="card"><div class="cardhead"><h2>What each paycheck covers</h2></div>${periods.length ? periods.map(p => `<div style="border:1px solid var(--line);border-radius:14px;padding:13px 15px;margin-bottom:10px"><div class="row sb"><b>${dshort(p.from)} – ${dshort(p.to)}</b><span class="badge ${p.net < 0 ? "bad" : "ok"}">${p.net < 0 ? "short " + fmt0(-p.net) : fmt0(p.net) + " left"}</span></div><div class="row sb small muted" style="margin:6px 0 8px"><span>Pay in ${fmt(p.inn)}</span><span>Bills ${fmt(p.out)}</span></div><div class="bar thick ${p.net < 0 ? "over" : "ok"}"><i style="width:${clamp(p.out / Math.max(1, p.inn), 0, 1) * 100}%"></i></div>${p.bills.length ? `<div class="row wrap" style="gap:6px;margin-top:10px">${p.bills.map(o => `<span class="badge">${dshort(o.date)} · ${esc(o.bill.name)} ${fmt0(o.bill.amount)}</span>`).join("")}</div>` : ""}</div>`).join("") : `<div class="empty">Add your paycheck and Haven shows which bills each one has to cover.</div>`}</div></div>
+    + `<div class="grid g2"><div class="col"><div class="card"><div class="cardhead"><h2>What each paycheck covers</h2></div>${periods.length ? periods.map(p => `<div style="border:1px solid var(--line);border-radius:14px;padding:13px 15px;margin-bottom:10px"><div class="row sb"><b>${dshort(p.from)} – ${dshort(p.to)}</b><span class="badge ${p.net < 0 ? "bad" : "ok"}">${p.net < 0 ? "short " + fmt0(-p.net) : fmt0(p.net) + " left"}</span></div><div class="row sb small muted" style="margin:6px 0 8px"><span>Pay in ${fmt(p.inn)}</span><span>Bills ${fmt(p.out)}</span></div><div class="bar thick ${p.net < 0 ? "over" : "ok"}"><i style="width:${clamp(p.out / Math.max(1, p.inn), 0, 1) * 100}%"></i></div>${p.bills.length ? `<div class="row wrap" style="gap:6px;margin-top:10px">${p.bills.map(o => `<span class="badge">${dshort(o.date)} · ${esc(o.bill.name)} ${fmt0(o.amount)}</span>`).join("")}</div>` : ""}</div>`).join("") : `<div class="empty">Add your paycheck and Haven shows which bills each one has to cover.</div>`}</div></div>
     <div class="col"><div class="card"><div class="cardhead"><h2>Your income</h2></div>${S.income.length ? `<div class="list">${S.income.map(i => `<div class="item"><div class="emo">💰</div><div class="grow"><b>${esc(i.name)}</b> ${i === m ? '<span class="badge">main payday</span>' : ""}<div class="tiny muted">${FREQ[i.freq]} · next ${(E.occ(i, E.addDays(t, 1), E.addDays(t, 400))[0] && dshort(E.occ(i, E.addDays(t, 1), E.addDays(t, 400))[0])) || "–"}</div></div><span class="amt">${fmt(i.amount)}</span><button class="iconbtn" data-act="editIncome" data-id="${i.id}" aria-label="Edit ${esc(i.name)}">${ic("edit")}</button></div>`).join("")}</div>` : `<div class="empty">No income yet.</div>`}</div>
     <div class="card"><div class="cardhead"><h2>Next paydays</h2></div>${pays.length ? `<div class="list">${pays.map(p => `<div class="item">${dateBox(p.date, "ok")}<div class="grow">${esc(p.inc.name)}<div class="tiny muted">${rel(p.date)}</div></div><span class="amt" style="color:var(--ok)">+${fmt(p.amount)}</span></div>`).join("")}</div>` : `<div class="empty">–</div>`}</div>
     ${S.moneyIn.some(x => x.transfer) ? `<div class="card"><div class="cardhead"><h2>Moved to & from goals</h2><span class="tiny muted">tap 🗑 to undo</span></div><div class="list">${S.moneyIn.filter(x => x.transfer).slice().sort((a, b) => a.date < b.date ? 1 : -1).slice(0, 8).map(x => `<div class="item">${dateBox(x.date)}<div class="grow">${esc(x.name)}</div><span class="amt">${x.amount < 0 ? "−" + fmt(-x.amount) : "+" + fmt(x.amount)}</span><button class="iconbtn" data-act="undoMove" data-id="${x.id}" aria-label="Undo ${esc(x.name)}">${ic("trash")}</button></div>`).join("")}</div></div>` : ""}
@@ -1012,9 +1048,9 @@ function chalVals(c) {
 
 // =========================================================== DEBT
 function vDebt() {
-  const t = today(), D = S.debts.filter(d => d.balance > 0);
+  const t = today(), D = S.debts.filter(d => d.balance > 0 && !d.deleted);
   const total = D.reduce((a, d) => a + (+d.balance), 0), mins = D.reduce((a, d) => a + (+d.min), 0);
-  const orig = S.debts.reduce((a, d) => a + (+d.original || +d.balance), 0);
+  const orig = S.debts.filter(d => !d.deleted).reduce((a, d) => a + (+d.original || +d.balance), 0);
   if (viewState.extra === null) viewState.extra = +S.settings.debtExtra || 0;
   const ex = viewState.extra, meth = S.settings.debtMethod || "avalanche";
   const plan = E.debtPlan(D, ex, meth), base = E.debtPlan(D, 0, meth);
@@ -1022,8 +1058,8 @@ function vDebt() {
   const maxEx = Math.max(250, Math.ceil(mins * 1.5 / 50) * 50);
   const sooner = base.months === Infinity || plan.months === Infinity ? 0 : base.months - plan.months, saved = base.interest === Infinity || plan.interest === Infinity ? 0 : base.interest - plan.interest;
   const list = plan.order.map((id, i) => { const d = S.debts.find(x => x.id === id), p = (+d.original || +d.balance) ? 1 - d.balance / (+d.original || +d.balance) : 0; const pm = plan.payoff[id];
-    return `<div class="item" style="align-items:flex-start"><div class="emo">${i + 1}</div><div class="grow"><div class="row sb"><b>${esc(d.name)}</b><span class="amt">${fmt(d.balance)}</span></div><div class="bar" style="margin:7px 0 5px"><i style="width:${p * 100}%;background:var(--c${(i % 8) + 1})"></i></div><div class="row sb tiny muted"><span>${d.apr}% · ${fmt0(d.min)} a month${d.dueDay ? " · due the " + d.dueDay + "." : ""}</span><span>${pm ? "clear in " + pm + " month" + (pm > 1 ? "s" : "") : ""}</span></div></div><button class="iconbtn" data-act="editDebt" data-id="${d.id}" aria-label="Edit ${esc(d.name)}">${ic("edit")}</button></div>`; }).join("");
-  const paidOff = S.debts.filter(d => d.balance <= 0);
+    return `<div class="item" style="align-items:flex-start"><div class="emo">${i + 1}</div><div class="grow"><div class="row sb"><b>${esc(d.name)}</b><span class="amt">${fmt(d.balance)}</span></div><div class="bar" style="margin:7px 0 5px"><i style="width:${p * 100}%;background:var(--c${(i % 8) + 1})"></i></div><div class="row sb tiny muted"><span>${+d.apr || 0}% · ${fmt0(d.min)} a month${d.dueDay ? " · due the " + d.dueDay + "." : ""}</span><span>${pm ? "clear in " + pm + " month" + (pm > 1 ? "s" : "") : ""}</span></div></div><button class="iconbtn" data-act="editDebt" data-id="${d.id}" aria-label="Edit ${esc(d.name)}">${ic("edit")}</button></div>`; }).join("");
+  const paidOff = S.debts.filter(d => d.balance <= 0 && !d.deleted);
   return pageTop("Pay it off, your way", "Debt payoff", `<button class="btn pri" data-act="newDebt">${ic("plus")} Add a debt</button>`)
     + (D.length ? `<div class="grid g2"><div class="col"><div class="card" style="text-align:center;padding:26px 22px"><div class="caps">Debt-free</div><div class="bigdate" style="margin:6px 0 4px">${free ? MONTHS[E.pd(free).getMonth()] + " " + E.pd(free).getFullYear() : "Not yet – raise the payment"}</div><div class="sub">${free ? `in ${plan.months} months · ${fmt0(total)} to go` : "The minimums don't cover the interest yet."}</div>
     <div style="max-width:420px;margin:20px auto 0;text-align:left"><div class="row sb"><span class="small">Extra each month</span><b class="num">${fmt(ex)}</b></div><input type="range" min="0" max="${maxEx}" step="5" value="${ex}" data-act="extra" style="margin-top:8px"><div class="row sb tiny faint"><span>${fmt0(0)}</span><span>${fmt0(maxEx)}</span></div></div>
@@ -1059,7 +1095,7 @@ function vInsights() {
   const bydow = [0, 0, 0, 0, 0, 0, 0]; S.expenses.filter(e => E.diff(e.date, t) < 90).forEach(e => bydow[E.dow(e.date)] += +e.amount);
   const topDow = bydow.indexOf(Math.max(...bydow));
   const big = S.expenses.filter(e => e.date >= first).sort((a, b) => b.amount - a.amount).slice(0, 5);
-  const subs = S.bills.filter(b => b.kind === "sub" && !b.off).reduce((a, b) => a + E.perMonth(b), 0);
+  const subs = S.bills.filter(b => b.kind === "sub" && isLive(b)).reduce((a, b) => a + E.perMonth(b), 0);
   const ns = Object.keys(S.nospend).filter(d => S.nospend[d] && d >= first).length;
   const earned = Object.keys(MILESTONES).map(k => [k, ...MILESTONES[k], S.milestones[k]]);
   const diffPct = sameDayLast ? Math.round((thisM - sameDayLast) / sameDayLast * 100) : null;
@@ -1099,6 +1135,9 @@ function vSettings() {
 
 // ------------------------------------------------------------ leftover rescue
 function leftoverCard(s) {
+  // only with a recent balance and nothing overdue – otherwise the "extra" may not be real
+  if (!S.balance.ts || s.age > 7) return "";
+  if (E.billOcc(S, E.addDays(today(), -31), E.addDays(today(), -1)).some(o => !o.paid && !o.auto && !(o.bill.added && o.date < o.bill.added))) return "";
   if (S.settings.smooth === false || !s.periodStart || s.cushion < Math.max(20, (s.plan || 0) * 2)) return "";
   if ((S.cushionAck || {})[s.periodStart]) return "";
   if (E.diff(s.periodStart, today()) <= 2 && !(S.ritual || {})[s.periodStart]) return "";
@@ -1119,8 +1158,8 @@ function rescueModal(amount, title) {
     let g = S.goals.find(x => x.id === f.goal);
     commit(() => {
       if (!g) { g = { id: uid(), name: (f.newgoal || "Savings").slice(0, 40), emoji: "🌱", target: Math.max(a, 1000), saved: 0, monthly: "", by: "", history: [] }; S.goals.push(g); }
-      g.saved = Math.round((g.saved + a) * 100) / 100; (g.history = g.history || []).push({ date: today(), amount: a });
-      S.moneyIn.push({ id: uid(), name: `Moved to ${g.name}`, amount: -a, date: today(), ts: now(), transfer: true });
+      const mid = uid(); g.saved = Math.round((g.saved + a) * 100) / 100; (g.history = g.history || []).push({ date: today(), amount: a, mid });
+      S.moneyIn.push({ id: mid, name: `Moved to ${g.name}`, amount: -a, date: today(), ts: now(), transfer: true, gid: g.id });
       S.rescued = (S.rescued || 0) + a;
     });
     closeModal(); confetti(); toast(`🛟 ${fmt0(a)} rescued into <b>${esc(g.name)}</b>`);
@@ -1142,7 +1181,7 @@ function ritualModal() {
   const t = today(), s = E.safe(S, t, now()), start = s.periodStart || t, end = E.addDays(s.until, -1), days = Math.max(1, E.diff(start, s.until));
   const pay = E.payOcc(S, start, end).reduce((a, p) => a + p.amount, 0);
   const bills = E.billOcc(S, start, end).filter(o => !(o.bill.added && o.date < o.bill.added));
-  const billSum = bills.reduce((a, o) => a + (+o.bill.amount), 0);
+  const billSum = bills.reduce((a, o) => a + o.amount, 0);
   const goals = S.goals.filter(g => g.saved < g.target).map(g => ({ g, amt: Math.round((+g.monthly || E.goalPace(g, t).perMonthToDate || 0) * days / 30.4) })).filter(x => x.amt > 0);
   const draw = () => {
     const chosen = goals.filter((x, i) => !m || m.querySelector(`[name="g${i}"]`)?.checked !== false);
@@ -1163,7 +1202,7 @@ function ritualModal() {
     const k = e.target.closest("[data-k]")?.dataset.k; if (!k) return;
     if (k === "later") return closeModal();
     commit(() => {
-      goals.forEach((x, i) => { if (m.querySelector(`[name="g${i}"]`)?.checked) { x.g.saved = Math.round((x.g.saved + x.amt) * 100) / 100; (x.g.history = x.g.history || []).push({ date: t, amount: x.amt }); S.moneyIn.push({ id: uid(), name: `Moved to ${x.g.name}`, amount: -x.amt, date: t, ts: now(), transfer: true }); } });
+      goals.forEach((x, i) => { if (m.querySelector(`[name="g${i}"]`)?.checked) { const mid = uid(); x.g.saved = Math.round((x.g.saved + x.amt) * 100) / 100; (x.g.history = x.g.history || []).push({ date: t, amount: x.amt, mid }); S.moneyIn.push({ id: mid, name: `Moved to ${x.g.name}`, amount: -x.amt, date: t, ts: now(), transfer: true, gid: x.g.id }); } });
       S.ritual = S.ritual || {}; S.ritual[start] = true;
     });
     closeModal(); confetti(); toast("💸 Paycheck planned. Enjoy what's yours.");
@@ -1216,7 +1255,7 @@ function remModal(id, type) {
   m.addEventListener("click", e => {
     const k = e.target.closest("[data-k]")?.dataset.k;
     if (k === "del") { commit(() => S.remember = S.remember.filter(x => x.id !== id)); closeModal(); }
-    if (k === "save") { const f = form(m); if (!f.name.trim()) return toast("What is it?"); commit(() => { S.remember = S.remember || []; const n = { ...r, id: id || uid(), name: f.name.trim().slice(0, 50), type: f.type, amount: num(f.amount), date: f.date }; if (id) Object.assign(r, n); else S.remember.push(n); }); closeModal(); toast("Saved. Haven will nudge you in time."); }
+    if (k === "save") { const f = form(m); if (!f.name.trim()) return toast("What is it?"); commit(() => { S.remember = S.remember || []; const n = { ...r, id: id || uid(), name: f.name.trim().slice(0, 50), type: f.type, amount: pos(f.amount), date: f.date }; if (id) Object.assign(r, n); else S.remember.push(n); }); closeModal(); toast("Saved. Haven will nudge you in time."); }
   });
 }
 function remDone(id) {
@@ -1317,8 +1356,8 @@ const FEAT_ACT = {
   rescue: () => rescueModal(), cushionOk: () => { const s = E.safe(S, today(), now()); S.cushionAck = S.cushionAck || {}; S.cushionAck[s.periodStart] = true; commit(); toast("Okay – it stays as your cushion. 🛟"); },
   spread: () => { const s = E.safe(S, today(), now()); S.cushionSpread = S.cushionSpread || {}; const prev = S.cushionSpread[s.periodStart]; S.cushionSpread[s.periodStart] = { amount: Math.floor(s.cushion) + (prev ? prev.amount : 0), from: today() }; S.cushionAck = S.cushionAck || {}; S.cushionAck[s.periodStart] = true; commit(); toast(`Spread over the next ${s.days} days – about ${fmt(s.cushion / s.days)} more a day. ✨`); },
   ritual: ritualModal, ritualSkip: () => { const s = E.safe(S, today(), now()); S.ritual = S.ritual || {}; S.ritual[s.periodStart] = true; commit(); },
-  undoMove: b => { const x = S.moneyIn.find(y => y.id === b.dataset.id); if (!x) return; const nm = x.name.replace(/^(Moved to|From) /, ""), g = S.goals.find(y => y.name === nm);
-    commit(() => { S.moneyIn = S.moneyIn.filter(y => y !== x); if (g) g.saved = Math.max(0, Math.round((g.saved + x.amount) * 100) / 100); }); toast("Undone."); },
+  undoMove: b => { const x = S.moneyIn.find(y => y.id === b.dataset.id); if (!x) return; const nm = x.name.replace(/^(Moved to|From) /, ""), g = (x.gid && S.goals.find(y => y.id === x.gid)) || S.goals.find(y => y.name === nm);
+    commit(() => { S.moneyIn = S.moneyIn.filter(y => y !== x); if (g) { g.saved = Math.max(0, Math.round((g.saved + x.amount) * 100) / 100); g.history = (g.history || []).filter(h => h.mid !== x.id); } }); toast("Undone."); },
   remReopen: b => { const r = S.remember.find(x => x.id === b.dataset.id); if (r) commit(() => { delete r.done; }); },
   afford: affordModal, focus: () => { S.settings.focus = !S.settings.focus; commit(); },
   impBuy: b => addSpend({ amount: +b.dataset.p }), impCool: b => { commit(() => S.wish.push({ id: uid(), name: "Something I wanted", price: +b.dataset.p, why: "", ts: now() })); go("wish"); toast("Parked on your cool-off list – give it a name there. 🫧"); },
@@ -1331,7 +1370,7 @@ const FEAT_ACT = {
 function subList() {
   const t = today(), occs = E.billOcc(S, E.addDays(t, -31), E.addDays(t, 400));
   const out = [];
-  S.bills.filter(b => b.kind === "sub" && !b.off).forEach(b => {
+  S.bills.filter(b => b.kind === "sub" && isLive(b)).forEach(b => {
     const o = occs.find(x => x.bill.id === b.id && !(b.added && x.date < b.added) && (x.date >= t || (!x.paid && !x.auto)));
     out.push({ b, o, year: E.perMonth(b) * 12 });
   });
@@ -1339,12 +1378,12 @@ function subList() {
 }
 function cancelSoon() { // subscriptions with a cancel-by date within 7 days (or just passed, still unpaid this round)
   const t = today();
-  return S.bills.filter(b => b.kind === "sub" && !b.off && b.cancelBy && E.diff(t, b.cancelBy) >= 0 && E.diff(t, b.cancelBy) <= 7);
+  return S.bills.filter(b => b.kind === "sub" && isLive(b) && b.cancelBy && E.diff(t, b.cancelBy) >= 0 && E.diff(t, b.cancelBy) <= 7);
 }
 function weekLine() {
   const t = today(), o = E.billOcc(S, t, E.addDays(t, 6)).filter(x => !x.paid && !(x.bill.added && x.date < x.bill.added));
   if (!o.length) return "";
-  return `<div class="sub" style="margin:-4px 0 10px">This week: <b>${o.length} bill${o.length > 1 ? "s" : ""}</b> · <b class="num">${fmt(o.reduce((a, x) => a + (+x.bill.amount), 0))}</b></div>`;
+  return `<div class="sub" style="margin:-4px 0 10px">This week: <b>${o.length} bill${o.length > 1 ? "s" : ""}</b> · <b class="num">${fmt(o.reduce((a, x) => a + x.amount, 0))}</b></div>`;
 }
 function subRow(x) {
   const t = today(), b = x.b, o = x.o;
@@ -1407,7 +1446,7 @@ function installCard() {
 function transferCard() {
   return `<div class="card"><h2>${ic("up").replace("<svg", '<svg width="18" height="18" style="vertical-align:-3px"')} Move to another device</h2><div class="sub" style="margin:4px 0 12px">No account needed – your data stays yours. It takes about 30 seconds:</div>
   <div class="list"><div class="item"><div class="emo">1️⃣</div><span class="small">Here: tap <b>Send to my other device</b> and pick AirDrop, Drive, email or WhatsApp.</span></div><div class="item"><div class="emo">2️⃣</div><span class="small">On the other device: open Haven → Settings → <b>Restore from file</b>.</span></div></div>
-  <div class="row wrap" style="gap:8px;margin-top:12px"><button class="btn pri sm" data-act="shareBackup">${ic("up")} Send to my other device</button><button class="btn sm" data-act="restore">Restore from file</button></div>
+  <div class="row wrap" style="gap:8px;margin-top:12px"><button class="btn pri sm" data-act="shareBackup">${ic("up")} Send to my other device</button>${DEMO ? "" : `<button class="btn sm" data-act="restore">Restore from file</button>`}</div>
   <div class="tiny muted" style="margin-top:10px">${S.lastBackup ? "Last copy made " + rel(S.lastBackup) + ". Restoring replaces what's on the device you restore on." : "No copy made yet."}</div></div>`;
 }
 
@@ -1442,6 +1481,9 @@ const num = v => {
   else if ((s.match(/\./g) || []).length > 1 || /^-?\d{1,3}\.\d{3}$/.test(s)) s = s.replace(/\./g, "");    // 1.234.567 / 1.234
   const n = parseFloat(s); return isFinite(n) ? Math.round(n * 100) / 100 : 0;
 };
+// amounts that can't be below zero (bills, pay, goals, debts…): true + a toast when one is negative
+const negative = (...vals) => vals.some(v => num(v) < 0) ? (toast("Amounts can't be negative – type it without the minus."), true) : false;
+const pos = v => Math.max(0, num(v));
 function form(m) { const o = {}; m.querySelectorAll("[name]").forEach(e => o[e.name] = e.type === "checkbox" ? e.checked : e.value); return o; }
 const FREQ_OPTS = Object.entries(FREQ).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]);
 
@@ -1517,8 +1559,8 @@ function checkBalance(after, title, draft) {
   const m = modal(title || "What does your bank say?", `<div class="sub" style="margin-bottom:14px">Open your banking app and type what's in your <b>everyday</b> account(s) right now. Savings you don't spend from can stay out.</div>
     ${accs.map((a, i) => `<div class="field"><input class="inp" style="border:0;padding:0 0 2px;font-size:.8em;font-weight:500;color:var(--ink2);background:none" data-name="${i}" value="${esc(a.name)}" aria-label="Account name">${money("acc_" + i, a.val, i === 0 ? "autofocus" : "")}</div>`).join("")}
     <button class="link" data-k="addacc">+ another account (cash, second card…)</button>
-    ${payToday ? `<label class="row small" style="gap:8px;margin-top:14px"><input type="checkbox" name="paidin" ${pend ? "" : "checked"}> Today's pay (${fmt(payToday)}) is already in this balance</label>` : ""}
-    <div class="sub tiny" style="margin-top:14px">No need to fill in missed days – Haven starts fresh from this number. Bills dated up to today count as already in it once they're ticked.</div>`,
+    ${payToday ? `<label class="row small" style="gap:8px;margin-top:14px"><input type="checkbox" name="paidin" ${pend ? "" : "checked"}> My pay from today (${fmt(payToday)}) is already in this balance</label><div class="tiny muted" style="margin:2px 0 0 28px">Not there yet? Untick it and Haven adds it for you.</div>` : ""}
+    <div class="sub tiny" style="margin-top:14px">No need to fill in missed days – Haven starts fresh from this number. Tick bills that already left your account first, so nothing is counted twice.</div>`,
     `<button class="btn pri" data-k="save">Update my number</button>`);
   const collect = () => { m.querySelectorAll("[data-name]").forEach(i => accs[+i.dataset.name].name = i.value.slice(0, 30) || "Account"); accs.forEach((a, i) => a.val = m.querySelector(`[name="acc_${i}"]`).value); const pi = m.querySelector('[name="paidin"]'); accs.pend = pi ? !pi.checked : false; };
   m.addEventListener("click", e => {
@@ -1547,48 +1589,160 @@ function accountsModal() {
 
 // ------------------------------------------------------------ bills / income / money in
 const EMOJIS = ["🏠", "📱", "🌐", "⚡", "💧", "🔥", "🚗", "🛡️", "📺", "🎵", "🏋️", "☁️", "🎓", "👶", "🐾", "💳", "🏦", "🧾", "💰", "✨"];
+// first occurrence of a bill's current version that hasn't gone out yet (not ticked, not autopaid) – its "next due"
+function billSplit(b) {
+  const t = today(), k0 = E.addDays(t, -31);
+  const o = E.billOcc({ ...S, bills: [b], debts: [] }, b.added && b.added > k0 ? b.added : k0, E.addDays(t, 800)).find(o => !o.bill.old && !o.paid && !(o.auto && o.date < t));
+  return o ? o.date : null;
+}
+// did the current version have occurrences (since it was added) before `before`? Then they're history to keep.
+function billHasPast(b, before) {
+  return E.billOcc({ ...S, bills: [b], debts: [] }, b.added || "2000-01-01", E.addDays(before, -1)).some(o => !o.bill.old);
+}
 function billModal(id, kind0) {
   const b = S.bills.find(x => x.id === id) || { name: "", amount: "", freq: "monthly", start: today(), kind: kind0 || "bill", autopay: false, emoji: kind0 === "sub" ? "📺" : "🧾" };
   let emo = b.emoji || "🧾";
+  const split = id ? billSplit(b) : null, shown = id && b.freq !== "once" && split ? split : b.start;
+  const stopped = !!(id && b.end);
   const m = modal(id ? "Edit bill" : "Add a bill", `
     <div class="row wrap" style="gap:6px;margin-bottom:14px" id="emos">${EMOJIS.map(e => `<button class="cat ${e === emo ? "on" : ""}" data-e="${e}" style="padding:5px 9px">${e}</button>`).join("")}</div>
+    ${stopped ? `<div class="stat warn" style="margin-bottom:12px"><b class="small">${b.end < today() ? "Stopped – the last one was" : "Stops – the last one is"} ${dshort(b.end)}.</b> <button class="link" data-k="resume">Start it again</button></div>` : ""}
     ${fld("What is it?", inp("name", b.name, 'placeholder="Rent, phone, Netflix…" autofocus'))}
     <div class="frow">${fld("Amount", money("amount", b.amount))}${fld("How often", sel("freq", FREQ_OPTS, b.freq))}</div>
-    <div class="frow">${fld("Next due date", `<input class="inp" type="date" name="start" value="${b.start}">`, "Haven repeats it from here.")}${fld("Type", sel("kind", [["bill", "Bill"], ["sub", "Subscription"], ["save", "Savings transfer"]], b.kind))}</div>
+    <div class="frow">${fld("Next due date", `<input class="inp" type="date" name="start" value="${shown}">`, id ? "Changes apply from here on – payments already made keep their amount and date." : "Haven repeats it from here.")}${fld("Type", sel("kind", [["bill", "Bill"], ["sub", "Subscription"], ["save", "Savings transfer"]], b.kind))}</div>
+    <div id="goalpick" class="${b.kind === "save" ? "" : "hidden"}">${fld("Goes to goal", sel("goal", [["", S.goals.length ? "– no goal –" : "– add a goal first –"], ...S.goals.map(g => [g.id, `${g.emoji || "🌟"} ${esc(g.name)}`])], b.goal || ""), "Each transfer adds to the goal once it goes out – on its date with autopay, or when you tick it.")}</div>
     ${fld("Cancel by (optional)", `<input class="inp" type="date" name="cancelBy" value="${b.cancelBy || ""}">`, "Free trial or yearly plan? Haven reminds you a week before.")}
     <label class="row small" style="gap:8px;margin:4px 0"><input type="checkbox" name="autopay" ${b.autopay ? "checked" : ""}> Autopay – it goes out by itself, no need to tick it</label>`,
-    `${id ? `<button class="btn danger" data-k="del">${ic("trash")}</button>` : ""}<button class="btn pri" data-k="save">${id ? "Save" : "Add bill"}</button>`);
+    `${id ? `<button class="btn danger" data-k="del" aria-label="Delete">${ic("trash")}</button>${b.freq !== "once" && !stopped ? `<button class="btn" data-k="stop">Stop it</button>` : ""}` : ""}<button class="btn pri" data-k="save">${id ? "Save" : "Add bill"}</button>`);
+  m.querySelector('[name="kind"]').addEventListener("change", e => m.querySelector("#goalpick").classList.toggle("hidden", e.target.value !== "save"));
   m.addEventListener("click", e => {
     const eb = e.target.closest("[data-e]"); if (eb) { emo = eb.dataset.e; m.querySelectorAll("#emos .cat").forEach(x => x.classList.toggle("on", x === eb)); return; }
     const k = e.target.closest("[data-k]")?.dataset.k;
-    if (k === "del") { if (confirm("Delete this bill?")) { commit(() => S.bills = S.bills.filter(x => x.id !== id)); closeModal(); } }
+    if (k === "del") {
+      // payments that already went out stay (dropping them would hand back money that's gone); only what's still to come goes
+      const keep = billHasPast(b, split || E.addDays(today(), 1));
+      if (!confirm(keep ? `Remove ${b.name}? Payments that already went out stay counted – nothing new will be due.` : `Delete ${b.name}?`)) return;
+      commit(() => { if (keep) { b.removed = true; if (split && !(b.end && b.end < split)) b.end = E.addDays(split, -1); } else S.bills = S.bills.filter(x => x.id !== id); syncGoals(); });
+      closeModal(); toast(keep ? "Removed." : "Deleted."); return;
+    }
+    if (k === "stop") return stopBill(b, split);
+    if (k === "resume") { commit(() => { delete b.end; }); closeModal(); toast(`${esc(b.name)} is back on.`); return; }
     if (k === "save") {
       const f = form(m); if (!f.name.trim() || !num(f.amount)) return toast("Add a name and an amount.");
-      const nb = { ...b, id: id || uid(), name: f.name.trim().slice(0, 40), amount: num(f.amount), freq: f.freq, start: f.start || today(), kind: f.kind, autopay: f.autopay, emoji: emo, cancelBy: f.cancelBy || "" };
-      if (id && +b.amount !== nb.amount) { nb.priceFrom = +b.amount; nb.priceAt = today(); }
-      if (!id) nb.added = f.start < today() ? f.start : today();
-      commit(() => { if (id) Object.assign(b, nb); else S.bills.push(nb); }); closeModal(); toast(id ? "Saved." : `${esc(nb.name)} added – Haven will remind you.`);
+      if (negative(f.amount)) return;
+      const amt = num(f.amount), start = f.start || shown || today(), goal = f.kind === "save" ? f.goal || "" : "";
+      const meta = { name: f.name.trim().slice(0, 40), kind: f.kind, autopay: f.autopay, emoji: emo, cancelBy: f.cancelBy || "", goal };
+      if (!id) {
+        const nb = { ...b, ...meta, id: uid(), amount: amt, freq: f.freq, start, added: start < today() ? start : today() };
+        if (goal) { nb.goalFrom = today(); nb.goalTs = now(); }
+        commit(() => { S.bills.push(nb); syncGoals(); }); closeModal(); toast(`${esc(nb.name)} added – Haven will remind you.`); return;
+      }
+      commit(() => {
+        if (goal && goal !== b.goal) { b.goalFrom = today(); b.goalTs = now(); }
+        const sched = amt !== +b.amount || f.freq !== b.freq || start !== shown;
+        if (sched) {
+          if (amt !== +b.amount) { b.priceFrom = +b.amount; b.priceAt = today(); }
+          const keepAnchor = start === shown && f.freq === b.freq;               // only the amount changed: keep month-end days etc.
+          const cut = split && start > split ? split : start;                     // the old schedule applies until the day before
+          if (b.freq !== "once" && billHasPast(b, cut)) {
+            b.versions = [...(Array.isArray(b.versions) ? b.versions : []), { start: b.start, from: b.from || "", amount: +b.amount, freq: b.freq, day2: b.day2, end: E.addDays(cut, -1) }];
+            if (keepAnchor) b.from = cut; else { b.start = start; delete b.from; }
+          } else if (!keepAnchor) { b.start = start; delete b.from; }
+          b.amount = amt; b.freq = f.freq;
+        }
+        Object.assign(b, meta);
+        syncGoals();
+      }); closeModal(); toast("Saved.");
     }
   });
 }
+function stopBill(b, split) {
+  const t = today(), past = E.billOcc({ ...S, bills: [b], debts: [] }, b.added || "2000-01-01", E.addDays(split || t, -1)).filter(o => !o.bill.old);
+  const min = past.length ? E.addDays(past[past.length - 1].date, 1) : b.added || b.start;
+  const m = modal(`Stop ${esc(b.name)}`, `${fld("No more payments from", `<input class="inp" type="date" name="from" value="${split || t}" min="${min}">`, "Cancelled or moved out? Payments before this date stay in your history.")}`, `<button class="btn pri" data-k="go">Stop it</button>`);
+  m.addEventListener("click", e => {
+    if (e.target.closest("[data-k]")?.dataset.k !== "go") return;
+    let d = form(m).from || split || t; if (d < min) d = min;
+    commit(() => { b.end = E.addDays(d, -1); syncGoals(); }); closeModal(); toast(`${esc(b.name)} stopped – nothing due from ${dshort(d)}.`);
+  });
+}
+// tick / untick one bill occurrence. Debt payments also lower what's owed; savings transfers feed their goal.
+function setPaid(k, on, ts) {
+  const i = k.lastIndexOf("|"), bid = k.slice(0, i), date = k.slice(i + 1);
+  if (on) S.paid[k] = ts || now(); else delete S.paid[k];
+  if (bid.startsWith("debt:")) debtTick(bid.slice(5), date, on);
+  syncGoals();
+}
+function debtTick(did, date, on) {
+  const d = S.debts.find(x => x.id === did); if (!d) return;
+  d.paidLog = d.paidLog && typeof d.paidLog === "object" ? d.paidLog : {};
+  if (on) {
+    if (d.paidLog[date] != null || !(d.balance > 0)) return;
+    const a = Math.round(Math.min(+d.min, +d.balance) * 100) / 100; if (!(a > 0)) return;
+    d.paidLog[date] = a; d.balance = Math.max(0, Math.round((d.balance - a) * 100) / 100);
+    if (d.balance <= 0) { d.end = date; milestone("debtGone"); }
+  } else {
+    const a = d.paidLog[date]; if (a == null) return;
+    delete d.paidLog[date]; if (d.end === date) delete d.end;
+    d.balance = Math.round((+d.balance + a) * 100) / 100;
+  }
+}
+// savings transfers linked to a goal: add each one to its goal exactly once when it goes out; take it back if unticked
+function syncGoals() {
+  const t = today(), X = S.goalXfer = S.goalXfer && typeof S.goalXfer === "object" ? S.goalXfer : {};
+  for (const k in X) {
+    const x = X[k], i = k.lastIndexOf("|"), date = k.slice(i + 1), b = S.bills.find(y => y.id === k.slice(0, i));
+    if (!b || S.paid[k] || (b.autopay && date <= t)) continue;                 // still went out (or bill deleted: keep)
+    const g = S.goals.find(y => y.id === x.g);
+    if (g) { g.saved = Math.max(0, Math.round((g.saved - x.a) * 100) / 100); g.history = (g.history || []).filter(h => h.src !== k); }
+    delete X[k];
+  }
+  const linked = S.bills.filter(b => b.kind === "save" && b.goal && !b.off);
+  if (!linked.length) return;
+  E.billOcc({ ...S, bills: linked, debts: [] }, E.addDays(t, -400), E.addDays(t, 400)).forEach(o => {
+    const b = o.bill, g = S.goals.find(y => y.id === b.goal);
+    if (X[o.key] || !g || (b.added && o.date < b.added)) return;
+    const from = b.goalFrom || t;
+    const gone = o.paid ? (typeof o.paidAt !== "number" || o.paidAt >= (+b.goalTs || 0) || o.date >= from) : o.auto && o.date <= t && o.date >= from;
+    if (!gone) return;
+    const was = g.saved;
+    g.saved = Math.round((g.saved + o.amount) * 100) / 100; (g.history = g.history || []).push({ date: o.date, amount: o.amount, src: o.key });
+    X[o.key] = { g: g.id, a: o.amount };
+    if (was < g.target && g.saved >= g.target) milestone("goalDone");
+  });
+}
 function payBill(k) {
-  const was = S.paid[k];
-  commit(() => { if (was) delete S.paid[k]; else S.paid[k] = now(); });
-  if (!was) { tickMinute("bills"); milestone("firstPaid"); const s = E.safe(S, today(), now()); if (s.due === 0 && s.dueList.length === 0) milestone("covered"); toast("Ticked off. One less thing to hold in your head.", () => commit(() => delete S.paid[k])); }
+  if (S.paid[k]) return commit(() => setPaid(k, false));
+  const date = k.slice(k.lastIndexOf("|") + 1), bal = S.balance;
+  // a bill due on/before the last balance check, ticked after it: was it already out of the bank back then?
+  if (bal.ts && date <= bal.date && now() > bal.ts) return askGone(k, date);
+  donePay(k, now());
+}
+function donePay(k, ts) {
+  commit(() => setPaid(k, true, ts));
+  tickMinute("bills"); milestone("firstPaid"); const s = E.safe(S, today(), now()); if (s.due === 0 && s.dueList.length === 0) milestone("covered");
+  toast("Ticked off. One less thing to hold in your head.", () => commit(() => setPaid(k, false)));
+}
+function askGone(k, date) {
+  const o = E.billOcc(S, date, date).find(x => x.key === k); if (!o) return donePay(k, now());
+  const bal = S.balance, when = bal.date === today() ? "earlier today" : rel(bal.date);
+  const m = modal("One quick question", `<p style="margin-top:0">When you checked your balance ${esc(when)}, had <b>${esc(o.bill.name)}</b> (${fmt(o.amount)}) already left your account?</p><div class="sub">So Haven doesn't count it twice – or forget it.</div>`,
+    `<button class="btn" data-k="now">No, it's going out now</button><button class="btn pri" data-k="gone">Yes, it was already gone</button>`);
+  m.addEventListener("click", e => { const a = e.target.closest("[data-k]")?.dataset.k; if (!a) return; closeModal(true); donePay(k, a === "gone" ? bal.ts - 1 : now()); });
 }
 function incomeModal(id) {
   const i = S.income.find(x => x.id === id) || { name: "Paycheck", amount: "", freq: "biweekly", start: E.addDays(today(), 1), main: !S.income.length };
   const m = modal(id ? "Edit income" : "Add income", `${fld("Name", inp("name", i.name, "autofocus"))}<div class="frow">${fld("Amount (after tax)", money("amount", i.amount))}${fld("How often", sel("freq", FREQ_OPTS.filter(f => f[0] !== "quarterly"), i.freq))}</div>
-    ${fld("Next payday", `<input class="inp" type="date" name="start" value="${i.start}">`, "Pick your next (or last) payday – Haven counts the rest.")}${i.freq === "semimonthly" || true ? fld("Second payday in the month (only for “twice a month”)", inp("day2", i.day2 || "", 'inputmode="numeric" placeholder="e.g. 15"')) : ""}
+    ${fld("Next payday", `<input class="inp" type="date" name="start" value="${i.start}">`, "Pick your next (or last) payday – Haven counts the rest.")}${i.freq === "semimonthly" || true ? fld("Second payday in the month (only for “twice a month”)", inp("day2", i.day2 || "", 'inputmode="numeric" placeholder="e.g. 15"'), "Leave empty: 1st → 15th, 15th → last day of the month.") : ""}
     <label class="row small" style="gap:8px"><input type="checkbox" name="main" ${i.main ? "checked" : ""}> This is my main payday (the number counts down to it)</label>`,
     `${id ? `<button class="btn danger" data-k="del">${ic("trash")}</button>` : ""}<button class="btn pri" data-k="save">Save</button>`);
   m.addEventListener("click", e => {
     const k = e.target.closest("[data-k]")?.dataset.k;
     if (k === "del") { if (confirm("Delete this income?")) { commit(() => S.income = S.income.filter(x => x.id !== id)); closeModal(); } }
     if (k === "save") {
-      const f = form(m); if (!num(f.amount)) return toast("Add an amount.");
+      const f = form(m); if (!num(f.amount)) return toast("Add an amount."); if (negative(f.amount)) return;
       commit(() => {
-        const ni = { ...i, id: id || uid(), name: f.name.trim().slice(0, 30) || "Paycheck", amount: num(f.amount), freq: f.freq, start: f.start || E.addDays(today(), 1), day2: +f.day2 || undefined, main: f.main };
+        const ni = { ...i, id: id || uid(), name: f.name.trim().slice(0, 30) || "Paycheck", amount: num(f.amount), freq: f.freq, start: f.start || E.addDays(today(), 1), day2: clamp(+f.day2 || 0, 0, 31) || undefined, main: f.main };
         if (ni.main) S.income.forEach(x => x.main = false);
         if (id) Object.assign(i, ni); else S.income.push(ni);
         if (!S.income.some(x => x.main)) S.income[0].main = true;
@@ -1598,7 +1752,7 @@ function incomeModal(id) {
 }
 function moneyInModal() {
   const m = modal("Extra money in", `${fld("What was it?", inp("name", "", 'placeholder="Refund, side job, birthday money…" autofocus'))}<div class="frow">${fld("Amount", money("amount"))}${fld("Date", `<input class="inp" type="date" name="date" value="${today()}">`)}</div>`, `<button class="btn pri" data-k="save">Add</button>`);
-  m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k !== "save") return; const f = form(m); if (!num(f.amount)) return toast("Add an amount."); commit(() => S.moneyIn.push({ id: uid(), name: f.name.trim() || "Money in", amount: num(f.amount), date: f.date || today(), ts: now() })); closeModal(); toast("Added – your number just grew."); });
+  m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k !== "save") return; const f = form(m); if (!num(f.amount)) return toast("Add an amount."); if (negative(f.amount)) return; commit(() => S.moneyIn.push({ id: uid(), name: f.name.trim() || "Money in", amount: num(f.amount), date: f.date || today(), ts: now() })); closeModal(); toast("Added – your number just grew."); });
 }
 
 // ------------------------------------------------------------ goals & challenges
@@ -1610,15 +1764,17 @@ function goalModal(id) {
   m.addEventListener("click", e => {
     const k = e.target.closest("[data-k]")?.dataset.k;
     if (k === "del") { if (confirm("Delete this goal?")) { commit(() => S.goals = S.goals.filter(x => x.id !== id)); closeModal(); } }
-    if (k === "save") { const f = form(m); if (!f.name.trim() || !num(f.target)) return toast("Add a name and an amount."); commit(() => { const ng = { ...g, id: id || uid(), name: f.name.trim().slice(0, 40), target: num(f.target), saved: num(f.saved), monthly: num(f.monthly) || "", by: f.by, emoji: f.emoji || "🌟", history: g.history || (num(f.saved) ? [{ date: today(), amount: num(f.saved) }] : []) }; if (id) Object.assign(g, ng); else S.goals.push(ng); }); closeModal(); }
+    if (k === "save") { const f = form(m); if (!f.name.trim() || !num(f.target)) return toast("Add a name and an amount."); if (negative(f.target, f.saved, f.monthly)) return;
+      // the starting amount is tagged so it doesn't count as a deposit in the pace
+      commit(() => { const ng = { ...g, id: id || uid(), name: f.name.trim().slice(0, 40), target: num(f.target), saved: num(f.saved), monthly: num(f.monthly) || "", by: f.by, emoji: f.emoji || "🌟", history: g.history || (num(f.saved) ? [{ date: today(), amount: num(f.saved), start: true }] : []) }; if (id) Object.assign(g, ng); else S.goals.push(ng); }); closeModal(); }
   });
 }
 function goalMove(id, sign) {
   const g = S.goals.find(x => x.id === id);
   const m = modal(sign > 0 ? `Add to ${esc(g.name)}` : `Take out of ${esc(g.name)}`, fld("Amount", money("amount", "", "autofocus")) + `<div class="sub">${sign > 0 ? "Money you already have in savings. It doesn't change your daily number." : "It goes back into your everyday money. Life happens – no judgement."}</div>`, `<button class="btn pri" data-k="save">${sign > 0 ? "Add" : "Take out"}</button>`);
-  m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k !== "save") return; const a = num(form(m).amount); if (!a) return; const was = g.saved, real = sign > 0 ? a : -Math.min(a, g.saved);
-    commit(() => { g.saved = Math.round((g.saved + real) * 100) / 100; (g.history = g.history || []).push({ date: today(), amount: real });
-      if (sign < 0 && real) S.moneyIn.push({ id: uid(), name: `From ${g.name}`, amount: -real, date: today(), ts: now(), transfer: true }); }); closeModal();
+  m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k !== "save") return; const a = num(form(m).amount); if (!(a > 0)) return toast(a < 0 ? "Type the amount without the minus." : "Type an amount."); const was = g.saved, real = sign > 0 ? a : -Math.min(a, g.saved);
+    commit(() => { const mid = uid(); g.saved = Math.round((g.saved + real) * 100) / 100; (g.history = g.history || []).push({ date: today(), amount: real, mid });
+      if (sign < 0 && real) S.moneyIn.push({ id: mid, name: `From ${g.name}`, amount: -real, date: today(), ts: now(), transfer: true, gid: g.id }); }); closeModal();
     if (sign > 0 && was < g.target && g.saved >= g.target) { if (S.milestones.goalDone) { confetti(); toast(`🎉 <b>${esc(g.name)}</b> – goal reached!`); } else milestone("goalDone"); }
     else toast(sign > 0 ? "Added. Look at it grow 🌱" : "Updated."); });
 }
@@ -1655,20 +1811,35 @@ function debtModal(id) {
     `${id ? `<button class="btn danger" data-k="del">${ic("trash")}</button>` : ""}<button class="btn pri" data-k="save">Save</button>`);
   m.addEventListener("click", e => {
     const k = e.target.closest("[data-k]")?.dataset.k;
-    if (k === "del") { if (confirm("Delete this debt?")) { commit(() => S.debts = S.debts.filter(x => x.id !== id)); closeModal(); } }
+    if (k === "del") {
+      // payments already made stay counted; the debt is just hidden and nothing new falls due
+      const last = id && debtLastDone(d);
+      if (!confirm(last ? `Remove ${d.name}? Payments already made stay counted.` : "Delete this debt?")) return;
+      commit(() => { if (last) { d.deleted = true; d.end = last; } else S.debts = S.debts.filter(x => x.id !== id); }); closeModal();
+    }
     if (k === "save") {
       const f = form(m); if (!f.name.trim()) return toast("Give it a name.");
-      const was = d.balance;
-      commit(() => { const nd = { ...d, id: id || uid(), name: f.name.trim().slice(0, 40), balance: num(f.balance), apr: num(f.apr), min: num(f.min), dueDay: clamp(+f.dueDay || 0, 0, 31) || "", order: +f.order || 1, original: num(f.original) || d.original || num(f.balance), autopay: f.autopay }; if (!id) nd.added = today(); if (id) Object.assign(d, nd); else S.debts.push(nd); });
+      if (negative(f.balance, f.apr, f.min, f.original)) return;
+      const was = d.balance, lastDone = id ? debtLastDone(d) : null;
+      commit(() => { const nd = { ...d, id: id || uid(), name: f.name.trim().slice(0, 40), balance: num(f.balance), apr: num(f.apr), min: num(f.min), dueDay: clamp(+f.dueDay || 0, 0, 31) || "", order: +f.order || 1, original: num(f.original) || d.original || num(f.balance), autopay: f.autopay }; if (!id) nd.added = today(); if (id) Object.assign(d, nd); else S.debts.push(nd);
+        // paid off: keep the payments already made, stop future ones. Owing again: payments start again.
+        if (id && was > 0 && d.balance <= 0) d.end = lastDone || E.addDays(d.added || today(), -1);
+        if (d.balance > 0) delete d.end; });
       closeModal(); if (id && was > 0 && num(f.balance) <= 0) milestone("debtGone");
     }
   });
 }
 
+// last minimum payment of a debt that went out (ticked, or autopay up to today)
+function debtLastDone(d) {
+  const t = today(), os = E.billOcc({ ...S, bills: [], debts: [{ ...d, balance: Math.max(+d.balance, 1), end: undefined, deleted: false }] }, d.added || "2000-01-01", E.addDays(t, 400)).filter(o => o.paid || (o.auto && o.date <= t));
+  return os.length ? os[os.length - 1].date : null;
+}
+
 // ------------------------------------------------------------ cool-off list
 function wishModal() {
   const m = modal("Park it for later", `${fld("What is it?", inp("name", "", 'placeholder="That lovely new notebook" autofocus'))}${fld("Price", money("price"))}${fld("What would it add to your life?", inp("why", "", 'placeholder="A need, a treat, or a passing feeling?"'))}`, `<button class="btn pri" data-k="save">Give it ${S.settings.cool < 24 ? S.settings.cool + " hours" : S.settings.cool / 24 + " day" + (S.settings.cool > 24 ? "s" : "")}</button>`);
-  m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k !== "save") return; const f = form(m); if (!f.name.trim()) return toast("What is it?"); commit(() => S.wish.push({ id: uid(), name: f.name.trim().slice(0, 50), price: num(f.price), why: f.why.trim().slice(0, 120), ts: now() })); closeModal(); toast("Parked. Future you will decide. 🫧"); });
+  m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k !== "save") return; const f = form(m); if (!f.name.trim()) return toast("What is it?"); if (negative(f.price)) return; commit(() => S.wish.push({ id: uid(), name: f.name.trim().slice(0, 50), price: num(f.price), why: f.why.trim().slice(0, 120), ts: now() })); closeModal(); toast("Parked. Future you will decide. 🫧"); });
 }
 function wishDecide(id, buy) {
   const w = S.wish.find(x => x.id === id);
@@ -1680,9 +1851,17 @@ function wishDecide(id, buy) {
 // ------------------------------------------------------------ categories & quick buttons
 function catsModal() {
   const m = modal("Categories & monthly budgets", `<div class="sub" style="margin-bottom:12px">Budgets are optional – leave 0 to just track.</div><div id="cl">${S.cats.map(c => `<div class="erow"><input class="inp e" data-f="emoji" data-id="${c.id}" value="${esc(c.emoji)}" aria-label="Emoji"><input class="inp n" data-f="name" data-id="${c.id}" value="${esc(c.name)}" aria-label="Name"><input class="inp a" data-f="budget" data-id="${c.id}" value="${c.budget || ""}" inputmode="decimal" placeholder="budget" aria-label="Monthly budget"><button class="iconbtn" data-del="${c.id}" aria-label="Remove">${ic("trash")}</button></div>`).join("")}</div><button class="link" data-k="add">+ add category</button>`, `<button class="btn pri" data-k="save">Save</button>`, { wide: true });
-  const collect = () => m.querySelectorAll("[data-f]").forEach(i => { const c = S.cats.find(x => x.id === i.dataset.id); if (!c) return; c[i.dataset.f] = i.dataset.f === "budget" ? num(i.value) : i.value.slice(0, i.dataset.f === "emoji" ? 4 : 30); });
+  const collect = () => m.querySelectorAll("[data-f]").forEach(i => { const c = S.cats.find(x => x.id === i.dataset.id); if (!c) return; c[i.dataset.f] = i.dataset.f === "budget" ? pos(i.value) : i.value.slice(0, i.dataset.f === "emoji" ? 4 : 30); });
   m.addEventListener("click", e => {
-    const d = e.target.closest("[data-del]"); if (d) { collect(); if (S.cats.length > 1) S.cats = S.cats.filter(c => c.id !== d.dataset.del); save(); catsModal(); return; }
+    const d = e.target.closest("[data-del]"); if (d) {
+      collect(); const id = d.dataset.del, c = S.cats.find(x => x.id === id); if (!c) return;
+      if (id === "other") return toast("“Other” stays – spends from deleted categories land there.");
+      const n = S.expenses.filter(x => x.cat === id).length;
+      if (!confirm(`Delete “${c.name}”?${n ? ` Its ${n} spend${n > 1 ? "s" : ""} move to “Other”.` : ""}`)) return;
+      if (!S.cats.some(x => x.id === "other")) S.cats.push({ ...DEFAULT_CATS.find(x => x.id === "other") });
+      S.expenses.forEach(x => { if (x.cat === id) x.cat = "other"; }); S.settings.quick.forEach(q => { if (q.cat === id) q.cat = "other"; });
+      S.cats = S.cats.filter(x => x.id !== id); save(); catsModal(); return;
+    }
     const k = e.target.closest("[data-k]")?.dataset.k;
     if (k === "add") { collect(); S.cats.push({ id: uid(), name: "New category", emoji: "🌼", budget: 0, color: `var(--c${(S.cats.length % 8) + 1})` }); save(); catsModal(); }
     if (k === "save") { collect(); commit(); closeModal(); }
@@ -1692,7 +1871,7 @@ function quickModal() {
   const q = S.settings.quick;
   const row = (x, i) => `<div class="erow"><input class="inp e" data-i="${i}" data-f="emoji" value="${esc(x.emoji)}" aria-label="Emoji"><input class="inp n" data-i="${i}" data-f="label" value="${esc(x.label)}" aria-label="Name"><input class="inp a" data-i="${i}" data-f="amount" value="${x.amount}" inputmode="decimal" aria-label="Amount">${sel("c" + i, S.cats.map(c => [c.id, c.emoji + " " + c.name]), x.cat).replace('class="inp"', 'class="inp c" aria-label="Category"')}<button class="iconbtn" data-del="${i}" aria-label="Remove">${ic("trash")}</button></div>`;
   const m = modal("One-tap buttons", `<div class="sub" style="margin-bottom:12px">Things you buy often. One tap logs them.</div>${q.map(row).join("")}${q.length < 6 ? `<button class="link" data-k="add">+ add button</button>` : ""}`, `<button class="btn pri" data-k="save">Save</button>`, { wide: true });
-  const collect = () => { m.querySelectorAll("[data-f]").forEach(i => { const x = q[+i.dataset.i]; x[i.dataset.f] = i.dataset.f === "amount" ? num(i.value) : i.value.slice(0, 20); }); q.forEach((x, i) => { const s = m.querySelector(`[name="c${i}"]`); if (s) x.cat = s.value; }); };
+  const collect = () => { m.querySelectorAll("[data-f]").forEach(i => { const x = q[+i.dataset.i]; x[i.dataset.f] = i.dataset.f === "amount" ? pos(i.value) : i.value.slice(0, 20); }); q.forEach((x, i) => { const s = m.querySelector(`[name="c${i}"]`); if (s) x.cat = s.value; }); };
   m.addEventListener("click", e => {
     const d = e.target.closest("[data-del]"); if (d) { collect(); q.splice(+d.dataset.del, 1); save(); quickModal(); return; }
     const k = e.target.closest("[data-k]")?.dataset.k;
@@ -1703,7 +1882,7 @@ function quickModal() {
 
 // ------------------------------------------------------------ day, money minute, explain, welcome back, more
 function dayModal(d) {
-  const tx = S.expenses.filter(e => e.date === d), bills = E.billOcc(S, d, d), pays = E.payOcc(S, d, d);
+  const tx = S.expenses.filter(e => e.date === d), bills = E.billOcc(S, d, d).filter(o => !(o.bill.added && o.date < o.bill.added)), pays = E.payOcc(S, d, d);
   const m = modal(dlong(d), `${pays.map(p => `<div class="item"><div class="emo">💰</div><span class="grow">${esc(p.inc.name)}</span><span class="amt" style="color:var(--ok)">+${fmt(p.amount)}</span></div>`).join("")}${bills.length ? `<div class="list">${bills.map(o => billRow(o, true)).join("")}</div>` : ""}
     <div class="caps" style="margin:14px 0 4px">Spending</div>${tx.length ? `<div class="list">${tx.map(expRow).join("")}</div>` : `<div class="sub">${S.nospend[d] ? "⭐ A no-spend day." : "Nothing logged."}</div>`}`,
     `${d <= today() && !tx.length ? `<button class="btn" data-k="ns">${S.nospend[d] ? "Unmark no-spend" : "⭐ No-spend day"}</button>` : ""}<button class="btn pri" data-k="add">Add a spend</button>`);
@@ -1716,6 +1895,7 @@ function moneyMinute(step = 0) {
   if (step === 0) {
     const due = E.billOcc(S, E.addDays(t, -31), t).filter(o => !o.paid && !o.auto && !(o.bill.added && o.date < o.bill.added));
     const m = modal("Step 1 of 3 · Bills", due.length ? `<div class="sub" style="margin-bottom:8px">Did any of these go out already? Tick them – then you'll check your balance.</div><div class="list">${due.map(o => billRow(o, true)).join("")}</div>` : `<div class="empty">No bills waiting. ✨</div>`, `<button class="btn pri" data-k="next">Next</button>`);
+    m.dataset.mm = "1";
     m.addEventListener("click", e => { if (e.target.closest("[data-k]")?.dataset.k === "next") { tickMinute("bills"); save(); moneyMinute(1); } });
     return;
   }
@@ -1754,15 +1934,19 @@ function moreMenu() {
 function download(name, text, type) { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500); }
 function backup() { if (DEMO) return toast("Backups work in the full app."); S.lastBackup = today(); save(); download(`haven-backup-${today()}.json`, JSON.stringify(S), "application/json"); toast("Backup downloaded. Keep it somewhere safe (Files, Drive, email to yourself)."); }
 function restore(file) {
+  const fi = $("#restoreFile"); if (fi) fi.value = "";                       // so the same file can be picked again
+  if (DEMO) return toast("Restoring a backup works in the full app.");
   const r = new FileReader();
-  r.onload = () => { let d; try { d = JSON.parse(r.result); if (!d || !d.settings || !Array.isArray(d.expenses)) throw 0; d = migrate(d); } catch (e) { return toast("That file isn't a Haven backup."); } if (!confirm("Replace everything on this device with the backup?")) return; S = d; S.setup = true; S.lastOpen = today(); flush(); render(); toast("Restored. Welcome back! ✨"); $("#restoreFile").value = ""; };
+  r.onload = () => { let d; try { d = JSON.parse(r.result); if (!d || !d.settings || !Array.isArray(d.expenses)) throw 0; d = migrate(d); } catch (e) { return toast("That file isn't a Haven backup."); }
+    if (S.setup && !confirm("Replace everything on this device with the backup?")) return;
+    S = d; S.setup = true; S.lastOpen = today(); loadProblem = ""; ob = { step: 0, bills: [] }; syncGoals(); flush(); render(); toast("Restored. Welcome back! ✨"); };
   r.readAsText(file);
 }
 function ics() {
-  const bills = E.allBills(S).filter(b => b.freq !== "once" || b.start >= today());
+  const bills = E.liveBills(S, today()).filter(b => b.freq !== "once" || b.start >= today());
   if (!bills.length && !(S.remember || []).some(r => !r.done)) return toast("Add a bill first.");
   const rr = { weekly: "FREQ=WEEKLY", biweekly: "FREQ=WEEKLY;INTERVAL=2", "4weekly": "FREQ=WEEKLY;INTERVAL=4", monthly: "FREQ=MONTHLY", quarterly: "FREQ=MONTHLY;INTERVAL=3", yearly: "FREQ=YEARLY" };
-  const st = b => b.kind === "debt" ? E.occ(b, today(), E.addDays(today(), 40))[0] || today() : b.start;
+  const st = b => E.occ(b, today(), E.addDays(today(), 400))[0] || b.start;
   const icsEsc = s => String(s).replace(/\\/g, "\\\\").replace(/([,;])/g, "\\$1").replace(/\n/g, "\\n");
   const dayRule = ds => { ds = [...new Set(ds)].sort((a, b) => a - b); const hi = ds[ds.length - 1];
     if (hi <= 28) return "BYMONTHDAY=" + ds.join(","); if (hi === 31) return "BYMONTHDAY=" + ds.map(d => d === 31 ? -1 : d).join(",");
@@ -1773,9 +1957,10 @@ function ics() {
     const d = st(b).replace(/-/g, ""), nx = E.addDays(st(b), 1).replace(/-/g, "");
     lines.push("BEGIN:VEVENT", `UID:${b.id}@haven`, `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}Z`, `DTSTART;VALUE=DATE:${d}`, `DTEND;VALUE=DATE:${nx}`, "SUMMARY:" + icsEsc(`${b.emoji ? b.emoji + " " : ""}${b.name} · ${fmt(b.amount)}`), "DESCRIPTION:From your Haven budget planner");
     const day = E.pd(st(b)).getDate();
-    if (b.freq === "semimonthly") { const d1 = E.pd(b.start).getDate(), d2 = b.day2 || (d1 <= 15 ? d1 + 15 : d1 - 15); lines.push(`RRULE:FREQ=MONTHLY;${dayRule([d1, d2])}`); }
-    else if ((b.freq === "monthly" || b.freq === "quarterly") && day >= 29) lines.push(`RRULE:${rr[b.freq]};${dayRule([day])}`);
-    else if (rr[b.freq]) lines.push("RRULE:" + rr[b.freq]);
+    const until = b.end ? ";UNTIL=" + b.end.replace(/-/g, "") : "";
+    if (b.freq === "semimonthly") { const d1 = E.pd(b.start).getDate(), d2 = E.day2(b); lines.push(`RRULE:FREQ=MONTHLY;${dayRule([d1, d2])}${until}`); }
+    else if ((b.freq === "monthly" || b.freq === "quarterly") && day >= 29) lines.push(`RRULE:${rr[b.freq]};${dayRule([day])}${until}`);
+    else if (rr[b.freq]) lines.push("RRULE:" + rr[b.freq] + until);
     lines.push("BEGIN:VALARM", "TRIGGER:-PT15H", "ACTION:DISPLAY", "DESCRIPTION:" + icsEsc(`${b.name} is due tomorrow`), "END:VALARM", "END:VEVENT");
   });
   (S.remember || []).filter(r => !r.done && r.date && r.date >= today()).forEach(r => {
@@ -1794,15 +1979,16 @@ function vOnboard() {
   const st = S.settings, steps = `<div class="steps">${[0, 1, 2, 3].map(i => `<i class="${i <= ob.step ? "on" : ""}"></i>`).join("")}</div>`;
   const th = ["Blush", "Lavender", "Sky", "Sage", "Sand", "Stone"], sw = { Blush: "#8F605B", Lavender: "#6E5F8E", Sky: "#53718D", Sage: "#56765B", Sand: "#7D6550", Stone: "#625B56" };
   let body = "";
-  if (ob.step === 0) body = `<div class="caps">Welcome to</div><h1 style="font-size:2.6em;margin:6px 0 10px">Haven</h1><p class="muted" style="margin-top:0">A calm budget planner for busy, wandering brains. Three minutes of setup – then one number tells you what you can spend today.</p>
+  if (ob.step === 0) body = `${loadProblem ? `<div class="stat warn" style="margin-bottom:16px"><span class="small">${esc(loadProblem)}</span></div>` : ""}<div class="caps">Welcome to</div><h1 style="font-size:2.6em;margin:6px 0 10px">Haven</h1><p class="muted" style="margin-top:0">A calm budget planner for busy, wandering brains. Three minutes of setup – then one number tells you what you can spend today.</p>
     <div class="card" style="margin:20px 0">${fld("What should Haven call you?", `<input class="inp" id="ob_name" value="${esc(st.name)}" placeholder="optional">`)}${fld("Currency", sel("ob_cur", ["USD", "EUR", "GBP", "CAD", "AUD", "NZD", "CHF", "SEK", "NOK", "DKK", "PLN", "ZAR", "INR", "SGD", "JPY", "MXN", "BRL"].map(c => [c, c]), st.currency).replace('name="ob_cur"', 'id="ob_cur"'))}
     <div class="field"><label>Pick your color</label><div class="row wrap" style="gap:8px">${th.map(n => `<button class="pill ${st.theme === n ? "on" : ""}" data-act="obTheme" data-t="${n}"><span class="dot" style="background:${sw[n]}"></span>${n}</button>`).join("")}</div></div></div>
-    <div class="row sb"><button class="link" data-act="sample">Just look around with sample data</button><button class="btn pri" data-act="obNext">Let's start →</button></div>`;
+    <div class="row sb"><button class="link" data-act="sample">Just look around with sample data</button><button class="btn pri" data-act="obNext">Let's start →</button></div>
+    ${DEMO ? "" : `<div class="row" style="margin-top:14px"><button class="link" data-act="restore">${ic("up").replace("<svg", '<svg width="14" height="14" style="vertical-align:-2px"')} Restore from a backup</button><input type="file" id="restoreFile" accept=".json,application/json" class="hidden"></div>`}`;
   if (ob.step === 1) body = `<div class="caps">Step 1 · Your money now</div><h1 style="margin:6px 0 10px">What's in your bank?</h1><p class="muted" style="margin-top:0">Open your banking app and type what's in the account you spend from. Rough is fine.</p>
     <div class="card" style="margin:20px 0">${fld("Everyday account", `<input class="inp" id="ob_bal" inputmode="decimal" placeholder="0.00" value="${S.balance.ts ? S.balance.amount : ""}">`)}<div class="sub tiny">You can add cash or a second card later.</div></div>
     <div class="row sb"><button class="btn" data-act="obBack">← Back</button><button class="btn pri" data-act="obNext">Next →</button></div>`;
   if (ob.step === 2) { const i = S.income[0] || {}; body = `<div class="caps">Step 2 · Your paycheck</div><h1 style="margin:6px 0 10px">When does money come in?</h1><p class="muted" style="margin-top:0">Your number counts down to your next payday.</p>
-    <div class="card" style="margin:20px 0"><div class="frow">${fld("Amount after tax", `<input class="inp" id="ob_pay" inputmode="decimal" placeholder="0.00" value="${i.amount || ""}">`)}${fld("How often", sel("ob_freq", FREQ_OPTS.filter(f => !["once", "quarterly", "yearly"].includes(f[0])), i.freq || "biweekly").replace('name="ob_freq"', 'id="ob_freq"'))}</div>${fld("Next payday", `<input class="inp" type="date" id="ob_next" value="${i.start || E.addDays(today(), 7)}">`)}<div class="sub tiny">No regular paycheck? Skip – Haven then counts to the end of each month.</div></div>
+    <div class="card" style="margin:20px 0"><div class="frow">${fld("Amount after tax", `<input class="inp" id="ob_pay" inputmode="decimal" placeholder="0.00" value="${i.amount || ""}">`)}${fld("How often", sel("ob_freq", FREQ_OPTS.filter(f => !["once", "quarterly", "yearly"].includes(f[0])), i.freq || "biweekly").replace('name="ob_freq"', 'id="ob_freq"'))}</div><div class="frow">${fld("Next payday", `<input class="inp" type="date" id="ob_next" value="${i.start || E.addDays(today(), 7)}">`)}${fld("Second payday (twice a month only)", `<input class="inp" id="ob_day2" inputmode="numeric" placeholder="day, e.g. 15" value="${i.day2 || ""}">`)}</div><div class="sub tiny">No regular paycheck? Skip – Haven then counts to the end of each month.</div></div>
     <div class="row sb"><button class="btn" data-act="obBack">← Back</button><div class="row"><button class="link" data-act="obSkip">Skip</button><button class="btn pri" data-act="obNext">Next →</button></div></div>`; }
   if (ob.step === 3) body = `<div class="caps">Step 3 · Your bills</div><h1 style="margin:6px 0 10px">What goes out every month?</h1><p class="muted" style="margin-top:0">Tap the ones you have. Haven holds them back before you see your number, so they never surprise you.</p>
     <div class="card" style="margin:20px 0"><div class="row wrap" style="gap:8px">${COMMON.map(([n, e]) => `<button class="pill ${ob.bills.some(b => b.name === n) ? "on" : ""}" data-act="obBill" data-n="${n}">${e} ${n}</button>`).join("")}</div>
@@ -1813,8 +1999,8 @@ function vOnboard() {
 function obCollect() {
   if (ob.step === 0) { S.settings.name = ($("#ob_name")?.value || "").trim().slice(0, 30); S.settings.currency = $("#ob_cur")?.value || "USD"; }
   if (ob.step === 1) { ob.balEntered = !!($("#ob_bal")?.value || "").trim(); const v = num($("#ob_bal")?.value); S.accounts = [{ id: uid(), name: "Everyday account", amount: v }]; S.balance = { amount: v, date: today(), ts: now() }; }
-  if (ob.step === 2) { const a = num($("#ob_pay")?.value); if (a) S.income = [{ id: uid(), name: "Paycheck", amount: a, freq: $("#ob_freq").value, start: $("#ob_next").value || E.addDays(today(), 7), main: true }]; }
-  if (ob.step === 3) document.querySelectorAll("[data-ob]").forEach(i => { const b = ob.bills[+i.dataset.i]; if (b) b[i.dataset.ob] = i.dataset.ob === "day" ? clamp(+i.value || 1, 1, 31) : num(i.value); });
+  if (ob.step === 2) { const a = pos($("#ob_pay")?.value); S.income = a ? [{ id: uid(), name: "Paycheck", amount: a, freq: $("#ob_freq").value, start: $("#ob_next").value || E.addDays(today(), 7), day2: clamp(+$("#ob_day2")?.value || 0, 0, 31) || undefined, main: true }] : []; }
+  if (ob.step === 3) document.querySelectorAll("[data-ob]").forEach(i => { const b = ob.bills[+i.dataset.i]; if (b) b[i.dataset.ob] = i.dataset.ob === "day" ? clamp(+i.value || 1, 1, 31) : pos(i.value); });
   save();
 }
 function obFinish() {
@@ -1853,7 +2039,7 @@ const ACT = {
   backup, restore: () => $("#restoreFile").click(),
   sample: () => { if (S.setup && !confirm("Replace everything with sample data?")) return; S = window.HAVEN_SAMPLE(); S.setup = true; commit(); go("today"); toast("Sample data loaded – explore freely. Erase it in Settings when you're ready."); },
   reset: () => { if (!confirm("Erase everything on this device? This can't be undone. (Download a backup first?)")) return; S = blank(); ob = { step: 0, bills: [] }; commit(); go("today"); },
-  obTheme: b => { S.settings.theme = b.dataset.t; obCollect(); render(); }, obNext: () => { obCollect(); ob.step++; render(); }, obBack: () => { obCollect(); ob.step--; render(); }, obSkip: () => { ob.step++; render(); },
+  obTheme: b => { S.settings.theme = b.dataset.t; obCollect(); render(); }, obNext: () => { obCollect(); ob.step++; render(); }, obBack: () => { obCollect(); ob.step--; render(); }, obSkip: () => { if (ob.step === 2) { S.income = []; save(); } ob.step++; render(); },
   obBill: b => { obCollect(); const n = b.dataset.n, c = COMMON.find(x => x[0] === n); const i = ob.bills.findIndex(x => x.name === n); if (i >= 0) ob.bills.splice(i, 1); else ob.bills.push({ name: n, emoji: c[1], amount: c[2], day: 1 }); render(); },
   obDone: obFinish,
   ...FEAT_ACT, ...SUBS_ACT
@@ -1863,7 +2049,10 @@ document.addEventListener("click", e => {
   const f = ACT[b.dataset.act]; if (!f) return;
   if (b.tagName === "A" && b.getAttribute("href") === "javascript:void 0") e.preventDefault();
   if (b.dataset.act !== "close" && b.closest(".modal") && !["pay"].includes(b.dataset.act)) closeModal();
-  if (b.dataset.act === "pay" && b.closest(".modal")) { const was = !!S.paid[b.dataset.k]; if (was) delete S.paid[b.dataset.k]; else { S.paid[b.dataset.k] = now(); milestone("firstPaid"); } save(); b.classList.toggle("on", !was); return; }
+  if (b.dataset.act === "pay" && b.closest(".modal")) {
+    if (!b.closest(".modal").dataset.mm) { closeModal(true); return payBill(b.dataset.k); }      // e.g. day view: same as anywhere else
+    const was = !!S.paid[b.dataset.k]; setPaid(b.dataset.k, !was, now()); if (!was) milestone("firstPaid"); save(); b.classList.toggle("on", !was); return;
+  }
   f(b, e);
 });
 document.addEventListener("input", e => {
@@ -1885,13 +2074,14 @@ function boot() {
   const t = today();
   if (S.setup && !DEMO) {
     const away = E.diff(S.lastOpen || t, t);
-    if (away >= 4 && S.balance.ts) setTimeout(() => welcomeBack(away), 350);
+    if (away >= 4 && S.balance.ts && E.diff(S.balance.date, t) >= 4 && !(S.welcomeAt && E.diff(S.welcomeAt, t) < 7)) { S.welcomeAt = t; setTimeout(() => welcomeBack(away), 350); }
     S.holds = S.holds.filter(h => h.until > t);
+    syncGoals();
     S.lastOpen = t; save();
   }
   if ("serviceWorker" in navigator && location.protocol === "https:" && !window.HAVEN_NO_SW && !DEMO) navigator.serviceWorker.register("sw.js").catch(() => { });
   // the day rolls over while the app stays open
-  let lastDay = t; setInterval(() => { if (today() !== lastDay) { lastDay = today(); render(); } }, 60000);
+  let lastDay = t; setInterval(() => { if (today() !== lastDay) { lastDay = today(); if (S.setup && !DEMO) { syncGoals(); save(); } render(); } }, 60000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) rerender(); });
 }
 boot();
