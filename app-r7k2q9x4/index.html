@@ -295,10 +295,795 @@ html[data-dark="1"] .chal button.on{color:var(--ink)}
 .feat{border:1.5px solid var(--mid)}
 .big-emo{width:46px;height:46px;font-size:1.4em;background:var(--pale)}
 button.fresh{border:0;color:#fff;cursor:pointer;font:inherit;font-size:.82em}
+
+/* device sync */
+body{--acc:var(--hero);--acc2:var(--pale);--hl:var(--hero)}
+.walready{display:inline-flex;align-items:center;gap:8px;margin-top:16px;font-size:.95rem}.walready svg{width:18px;height:18px}
 </style></head>
 <body data-theme="Blush"><div id="root"></div>
-<script>window.HAVEN_DEMO=false;window.HAVEN_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.HAVEN_VERSION="1.0.0";</script>
-<script>/* Haven engine: dates, recurrence, safe-to-spend, look-ahead, debt, goals. No DOM. */
+<script>window.HAVEN_DEMO=false;window.HAVEN_SHOP="https://www.etsy.com/shop/TrueHavenStudios";window.HAVEN_VERSION="1.0.0";window.HAVEN_SYNC_URL="https://truehaven-sync.fishing-switzerland.workers.dev";</script>
+<script>/* TrueHaven Sync – end-to-end-encrypted device sync for the offline apps (client module).
+   One file, no libraries, WebCrypto only. Works in browsers and in Node 20+ (for tests).
+
+   Usage in an app (see README.md):
+     const SYNC = THSync.create({
+       appId: "bills", appName: "Bill Smoother", storageKey: "thbills.v1", url: window.BP_SYNC_URL, demo: DEMO,
+       getState: () => JSON string of the whole state (as it is saved),
+       applyState: json => replace the whole state through the app's normal load/migrate path, save it, re-render,
+       onChange: notify => { remember notify; call it after every local save },
+       describe: json => "12 bills · 3 jars"      (optional, shown in the conflict dialog),
+       hasData: () => true if this device holds data worth protecting  (optional),
+       validate: json => throws if json isn't this app's data       (optional),
+       rerender: () => app re-render                                   (optional)
+     });
+     SYNC.start();                     // after the app's first render
+     SYNC.pillHTML()                   // status pill, put it anywhere (updates itself)
+     SYNC.sectionHTML()                // the "Your devices" settings block (updates itself)
+     SYNC.openJoin()                   // "I already use it on another device"
+
+   Security model, briefly:
+   - Device A makes a random spaceId (128 bit), dataKey (AES-GCM 256) and writeToken (256 bit).
+   - Every save is encrypted on the device: AES-GCM, fresh 96-bit IV, additional data = app id + spaceId + version,
+     so the server can't swap copies between apps/spaces or pass an old copy off as a newer one.
+   - The server stores ciphertext + sha256(writeToken) only. Anyone without the dataKey sees random bytes.
+   - Linking: either a 6-digit code (online, server-mediated, see the honest note at pairSeal) or a QR/link whose
+     #fragment carries the secrets directly – fragments are never sent to any server.
+   - Secrets live in localStorage next to the app's own data (which is plain text there anyway). */
+(function (root) {
+  "use strict";
+  const VERSION = 1;
+  const PBKDF2_ITER = 600000;          // OWASP 2023 recommendation for PBKDF2-HMAC-SHA256
+  const DEBOUNCE = 3000, POLL = 60000, BACKOFF = [2000, 4000, 8000, 16000, 32000, 60000];
+  const MAX_CT = 1800000;              // keep in step with worker.js
+  const te = new TextEncoder(), td = new TextDecoder();
+  const subtle = () => (root.crypto || globalThis.crypto).subtle;
+  const rand = n => { const a = new Uint8Array(n); (root.crypto || globalThis.crypto).getRandomValues(a); return a; };
+
+  // ------------------------------------------------------------------ bytes
+  function b64(bytes) { let s = ""; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(s); }
+  function unb64(s) { const t = atob(s), a = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) a[i] = t.charCodeAt(i); return a; }
+  const b64url = bytes => b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const unb64url = s => unb64(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4));
+  const cat = (...arrs) => { const n = arrs.reduce((a, x) => a + x.length, 0), o = new Uint8Array(n); let p = 0; for (const x of arrs) { o.set(x, p); p += x.length; } return o; };
+  async function sha256hex(s) { const d = await subtle().digest("SHA-256", te.encode(s)); return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join(""); }
+
+  async function pipe(bytes, Stream, mode) {
+    const s = new Blob([bytes]).stream().pipeThrough(new Stream(mode));
+    return new Uint8Array(await new Response(s).arrayBuffer());
+  }
+  const canZip = () => typeof CompressionStream === "function" && typeof DecompressionStream === "function";
+
+  // ------------------------------------------------------------------ crypto
+  function newSecrets() { return { space: b64url(rand(16)), key: b64url(rand(32)), token: b64url(rand(32)) }; }
+  const keyCache = new Map();
+  async function dataKey(k) {
+    if (!keyCache.has(k)) keyCache.set(k, await subtle().importKey("raw", unb64url(k), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]));
+    return keyCache.get(k);
+  }
+  const aad = (appId, space, version) => te.encode(`th-sync/v${VERSION}|${appId}|${space}|${version}`);
+  // envelope: [1 format][1 flags: 1 = gzip][12 IV][AES-GCM ciphertext+tag], base64
+  async function seal(key, appId, space, version, text) {
+    let data = te.encode(text), flags = 0;
+    if (canZip()) { data = await pipe(data, CompressionStream, "gzip"); flags = 1; }
+    const iv = rand(12);
+    const ct = new Uint8Array(await subtle().encrypt({ name: "AES-GCM", iv, additionalData: aad(appId, space, version) }, await dataKey(key), data));
+    return b64(cat(Uint8Array.of(VERSION, flags), iv, ct));
+  }
+  async function open(key, appId, space, version, ctB64) {
+    const all = unb64(ctB64);
+    if (all[0] !== VERSION) throw new Error("unknown format");
+    const iv = all.subarray(2, 14), ct = all.subarray(14);
+    let data = new Uint8Array(await subtle().decrypt({ name: "AES-GCM", iv, additionalData: aad(appId, space, version) }, await dataKey(key), ct));
+    if (all[1] & 1) data = await pipe(data, DecompressionStream, "gzip");
+    return td.decode(data);
+  }
+
+  /* Pairing with a 6-digit code – how strong is it, honestly?
+     A 6-digit code has only 1,000,000 possibilities (~20 bits). Its safety comes from being ONLINE and SHORT-LIVED:
+       - the server hands out each code's blob exactly once, deletes it after 10 minutes, and limits lookups to
+         10 per minute (60 per hour) per IP address – an attacker guessing blindly has roughly a 1-in-10,000 chance
+         per IP during the 10 minutes, and a successful guess "uses up" the code, so the real device sees
+         "code didn't work" and the linking screen never says "Linked" – a visible warning sign;
+       - PBKDF2 (600,000 rounds, random salt) only slows down someone who already holds the blob (e.g. whoever runs
+         the server): trying all million codes then costs hours of GPU time, not years. It is NOT strong offline.
+     So: fine for linking your own phone while you hold both devices, not a long-term secret.
+     The QR code / link is the strong path: it carries the 256-bit keys in the URL #fragment, which browsers never
+     send to any server – nothing guessable is involved at all. */
+  async function codeKey(code, salt) {
+    const base = await subtle().importKey("raw", te.encode(code), "PBKDF2", false, ["deriveKey"]);
+    return subtle().deriveKey({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITER }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  async function pairSeal(code, appId, payload) {
+    const salt = rand(16), iv = rand(12);
+    const ct = new Uint8Array(await subtle().encrypt({ name: "AES-GCM", iv, additionalData: te.encode("th-pair/v1|" + appId) }, await codeKey(code, salt), te.encode(JSON.stringify(payload))));
+    return b64(cat(Uint8Array.of(1), salt, iv, ct));
+  }
+  async function pairOpen(code, appId, blob) {
+    const all = unb64(blob);
+    if (all[0] !== 1) throw new Error("unknown format");
+    const pt = await subtle().decrypt({ name: "AES-GCM", iv: all.subarray(17, 29), additionalData: te.encode("th-pair/v1|" + appId) }, await codeKey(code, all.subarray(1, 17)), all.subarray(29));
+    return JSON.parse(td.decode(pt));
+  }
+  // link: <app url>#link=<appId>.<base64url([1][16 space][32 key][32 token])>
+  function linkEncode(appId, s) { return appId + "." + b64url(cat(Uint8Array.of(1), unb64url(s.space), unb64url(s.key), unb64url(s.token))); }
+  function linkDecode(str) {
+    const m = /(?:#link=|^)([a-z0-9-]+)\.([A-Za-z0-9_-]{100,120})$/.exec(String(str || "").trim());
+    if (!m) return null;
+    const b = unb64url(m[2]);
+    if (b.length !== 81 || b[0] !== 1) return null;
+    return { app: m[1], space: b64url(b.subarray(1, 17)), key: b64url(b.subarray(17, 49)), token: b64url(b.subarray(49, 81)) };
+  }
+
+  // ------------------------------------------------------------------ QR code (byte mode, ECC M, versions 1–20)
+  const QR = (() => {
+    const ECC = [-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26];
+    const BLK = [-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16];
+    const mul = (x, y) => { let z = 0; for (let i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >>> 7) * 0x11D); z ^= ((y >>> i) & 1) * x; } return z; };
+    const rawMods = v => { let r = (16 * v + 128) * v + 64; if (v >= 2) { const n = Math.floor(v / 7) + 2; r -= (25 * n - 10) * n - 55; if (v >= 7) r -= 36; } return r; };
+    const dataCw = v => Math.floor(rawMods(v) / 8) - ECC[v] * BLK[v];
+    function rsDiv(d) { const r = new Array(d - 1).fill(0).concat([1]); let root = 1; for (let i = 0; i < d; i++) { for (let j = 0; j < r.length; j++) { r[j] = mul(r[j], root); if (j + 1 < r.length) r[j] ^= r[j + 1]; } root = mul(root, 2); } return r; }
+    function rsRem(data, div) { const r = div.map(() => 0); for (const b of data) { const f = b ^ r.shift(); r.push(0); div.forEach((c, i) => { r[i] ^= mul(c, f); }); } return r; }
+    function encode(text, forceMask) {
+      const bytes = [...te.encode(text)];
+      let v = 1; for (; v <= 20; v++) { if (4 + (v < 10 ? 8 : 16) + bytes.length * 8 <= dataCw(v) * 8) break; }
+      if (v > 20) throw new Error("too long for a QR code");
+      const bits = [], put = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+      put(4, 4); put(bytes.length, v < 10 ? 8 : 16); bytes.forEach(b => put(b, 8));
+      const cap = dataCw(v) * 8;
+      put(0, Math.min(4, cap - bits.length)); put(0, (8 - bits.length % 8) % 8);
+      for (let p = 0xEC; bits.length < cap; p ^= 0xEC ^ 0x11) put(p, 8);
+      const data = []; for (let i = 0; i < bits.length; i += 8) data.push(bits.slice(i, i + 8).reduce((a, b) => a << 1 | b, 0));
+      // split into blocks, add error correction, interleave
+      const nb = BLK[v], el = ECC[v], raw = Math.floor(rawMods(v) / 8), nShort = nb - raw % nb, shortLen = Math.floor(raw / nb), div = rsDiv(el), blocks = [];
+      for (let i = 0, k = 0; i < nb; i++) { const d = data.slice(k, k + shortLen - el + (i < nShort ? 0 : 1)); k += d.length; const e = rsRem(d, div); if (i < nShort) d.push(0); blocks.push(d.concat(e)); }
+      const cw = []; for (let i = 0; i < blocks[0].length; i++) blocks.forEach((b, j) => { if (i !== shortLen - el || j >= nShort) cw.push(b[i]); });
+      // draw
+      const size = v * 4 + 17, M = [...Array(size)].map(() => new Array(size).fill(false)), F = [...Array(size)].map(() => new Array(size).fill(false));
+      const set = (x, y, d) => { M[y][x] = d; F[y][x] = true; };
+      for (let i = 0; i < size; i++) { set(6, i, i % 2 === 0); set(i, 6, i % 2 === 0); }
+      const finder = (cx, cy) => { for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) { const x = cx + dx, y = cy + dy, dist = Math.max(Math.abs(dx), Math.abs(dy)); if (x >= 0 && x < size && y >= 0 && y < size) set(x, y, dist !== 2 && dist !== 4); } };
+      finder(3, 3); finder(size - 4, 3); finder(3, size - 4);
+      if (v > 1) {
+        const n = Math.floor(v / 7) + 2, step = Math.ceil((v * 4 + 4) / (n * 2 - 2)) * 2, pos = [6];
+        for (let p = size - 7; pos.length < n; p -= step) pos.splice(1, 0, p);
+        pos.forEach((a, i) => pos.forEach((b, j) => { if ((i === 0 && j === 0) || (i === 0 && j === n - 1) || (i === n - 1 && j === 0)) return; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) set(a + dx, b + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1); }));
+      }
+      const format = mask => { const d = (0 << 3) | mask; let r = d; for (let i = 0; i < 10; i++) r = (r << 1) ^ ((r >>> 9) * 0x537); const b = ((d << 10) | r) ^ 0x5412, g = i => ((b >>> i) & 1) === 1;
+        for (let i = 0; i <= 5; i++) set(8, i, g(i)); set(8, 7, g(6)); set(8, 8, g(7)); set(7, 8, g(8)); for (let i = 9; i < 15; i++) set(14 - i, 8, g(i));
+        for (let i = 0; i < 8; i++) set(size - 1 - i, 8, g(i)); for (let i = 8; i < 15; i++) set(8, size - 15 + i, g(i)); set(8, size - 8, true); };
+      format(0);
+      if (v >= 7) { let r = v; for (let i = 0; i < 12; i++) r = (r << 1) ^ ((r >>> 11) * 0x1F25); const b = (v << 12) | r; for (let i = 0; i < 18; i++) { const d = ((b >>> i) & 1) === 1, a = size - 11 + i % 3, c = Math.floor(i / 3); set(a, c, d); set(c, a, d); } }
+      let i = 0;
+      for (let right = size - 1; right >= 1; right -= 2) {
+        if (right === 6) right = 5;
+        for (let vert = 0; vert < size; vert++) for (let j = 0; j < 2; j++) {
+          const x = right - j, up = ((right + 1) & 2) === 0, y = up ? size - 1 - vert : vert;
+          if (!F[y][x] && i < cw.length * 8) { M[y][x] = ((cw[i >>> 3] >>> (7 - (i & 7))) & 1) === 1; i++; }
+        }
+      }
+      const MASKS = [(x, y) => (x + y) % 2 === 0, (x, y) => y % 2 === 0, x => x % 3 === 0, (x, y) => (x + y) % 3 === 0, (x, y) => (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0,
+        (x, y) => x * y % 2 + x * y % 3 === 0, (x, y) => (x * y % 2 + x * y % 3) % 2 === 0, (x, y) => ((x + y) % 2 + x * y % 3) % 2 === 0];
+      const flip = m => { for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!F[y][x] && MASKS[m](x, y)) M[y][x] = !M[y][x]; };
+      const FIND = [1, 0, 1, 1, 1, 0, 1];
+      const penalty = () => {   // the four standard rules: runs, 2x2 boxes, finder lookalikes, dark/light balance
+        let p = 0, dark = 0;
+        for (let a = 0; a < size; a++) for (const row of [true, false]) {
+          const line = []; for (let b = 0; b < size; b++) line.push(row ? M[a][b] : M[b][a]);
+          let run = 1; for (let b = 1; b < size; b++) { if (line[b] === line[b - 1]) { run++; if (run === 5) p += 3; else if (run > 5) p++; } else run = 1; }
+          const L = new Array(4).fill(false).concat(line, new Array(4).fill(false));
+          for (let i = 4; i + 7 <= size + 4; i++) {
+            if (!FIND.every((f, k) => L[i + k] === !!f)) continue;
+            if ([1, 2, 3, 4].every(k => !L[i - k]) || [7, 8, 9, 10].every(k => !L[i + k])) p += 40;
+          }
+        }
+        for (let y = 0; y < size - 1; y++) for (let x = 0; x < size - 1; x++) { const c = M[y][x]; if (c === M[y][x + 1] && c === M[y + 1][x] && c === M[y + 1][x + 1]) p += 3; }
+        M.forEach(r => r.forEach(c => { if (c) dark++; }));
+        return p + Math.floor(Math.abs(dark * 20 - size * size * 10) / (size * size)) * 10;
+      };
+      let best = 0, bestP = Infinity;
+      for (let m = 0; m < 8; m++) { flip(m); format(m); const p = penalty(); if (p < bestP) { bestP = p; best = m; } flip(m); }
+      if (forceMask >= 0 && forceMask < 8) best = forceMask;
+      flip(best); format(best);
+      return M;
+    }
+    function svg(text, px = 220) {
+      const M = encode(text), n = M.length, q = 3, w = n + q * 2; let d = "";
+      px = w * Math.max(2, Math.round(px / w));          // whole pixels per module: crisp, evenly sized squares
+      M.forEach((r, y) => r.forEach((c, x) => { if (c) d += `M${x + q} ${y + q}h1v1h-1z`; }));
+      return `<svg class="ths-qrsvg" width="${px}" height="${px}" viewBox="0 0 ${w} ${w}" shape-rendering="crispEdges" role="img" aria-label="QR code"><rect width="${w}" height="${w}" fill="#fff"/><path d="${d}" fill="#111"/></svg>`;
+    }
+    return { encode, svg };
+  })();
+
+  // ------------------------------------------------------------------ small helpers
+  const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const LS = {
+    get(k) { try { return root.localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { root.localStorage.setItem(k, v); return true; } catch (e) { return false; } },
+    del(k) { try { root.localStorage.removeItem(k); } catch (e) { } }
+  };
+  function deviceName() {
+    const ua = (root.navigator && navigator.userAgent) || "";
+    if (/iPhone/.test(ua)) return "iPhone";
+    if (/iPad/.test(ua) || (/Macintosh/.test(ua) && root.navigator && navigator.maxTouchPoints > 1)) return "iPad";
+    if (/Android/.test(ua)) return /Mobile/.test(ua) ? "Android phone" : "Android tablet";
+    if (/CrOS/.test(ua)) return "Chromebook";
+    if (/Macintosh|Mac OS X/.test(ua)) return "Mac";
+    if (/Windows/.test(ua)) return "Windows PC";
+    if (/Linux/.test(ua)) return "Linux computer";
+    return "other device";
+  }
+  const IC = {
+    lock: '<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/>',
+    devices: '<rect x="2.5" y="5" width="13" height="10" rx="1.6"/><path d="M6 18.5h6"/><rect x="16.5" y="8" width="5" height="11" rx="1.3"/>',
+    link: '<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/>',
+    sync: '<path d="M20 11a8 8 0 0 0-14.3-4.3L4 8.5"/><path d="M4 4v4.5h4.5"/><path d="M4 13a8 8 0 0 0 14.3 4.3L20 15.5"/><path d="M20 20v-4.5h-4.5"/>',
+    x: '<path d="M6 6l12 12M18 6L6 18"/>', check: '<path d="M5 12.5l4.5 4.5L19 7.5"/>', copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a1 1 0 0 1 1-1h10"/>',
+    phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.2"/><path d="M11 18.5h2"/>', alert: '<path d="M12 3.5 21.5 20h-19z"/><path d="M12 10v4.5M12 17.2v.3"/>',
+    cloudoff: '<path d="M3 3l18 18"/><path d="M8.5 7.2A5.5 5.5 0 0 1 17 10h.5a3.5 3.5 0 0 1 2.1 6.3M16 18H7a4 4 0 0 1-1.2-7.8"/>'
+  };
+  const ic = (n, c = "") => `<svg class="ths-ic ${c}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${IC[n]}</svg>`;
+
+  const CSS = `
+.ths-pill{display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 12px 0 10px;border-radius:99px;border:1px solid var(--line,#ddd);background:var(--card,#fff);color:var(--ink2,#555);font:500 .8rem/1 var(--sans,system-ui);white-space:nowrap;cursor:pointer;max-width:100%}
+.ths-pill:hover{border-color:var(--line2,#ccc);color:var(--ink,#111)}
+.ths-pill i{width:7px;height:7px;border-radius:50%;background:var(--ok,#2E7558);flex:none}
+.ths-pill[data-s="syncing"] i,.ths-pill[data-s="pending"] i{background:var(--acc,#1F3A5F);animation:ths-pulse 1.2s ease-in-out infinite}
+.ths-pill[data-s="offline"] i{background:var(--ink3,#888)}
+.ths-pill[data-s="fix"]{color:var(--bad,#B0281C);border-color:color-mix(in srgb,var(--bad,#B0281C) 35%,var(--line,#ddd))}
+.ths-pill[data-s="fix"] i{background:var(--bad,#B0281C)}
+@keyframes ths-pulse{50%{opacity:.35}}
+.ths-sec .ths-state{display:flex;align-items:center;gap:14px;padding:14px 16px;border:1px solid var(--line,#ddd);border-radius:14px;background:var(--bg,#f6f6f6);margin-bottom:16px}
+.ths-sec .ths-state .ths-ic{width:22px;height:22px;color:var(--acc,#1F3A5F)}
+.ths-sec .ths-state b{display:block;font-weight:500;font-size:.98rem}
+.ths-sec .ths-state small{display:block;color:var(--ink3,#777);font-size:.84rem;margin-top:1px}
+.ths-sec .ths-state.fix .ths-ic{color:var(--bad,#B0281C)}
+.ths-sec .ths-p{font-size:.88rem;color:var(--ink2,#555);line-height:1.5;margin:0 0 16px}
+.ths-sec .ths-row{display:flex;gap:8px;flex-wrap:wrap}
+.ths-sec .ths-row+.ths-row{margin-top:10px}
+.ths-sec .ths-quiet{display:flex;gap:18px;flex-wrap:wrap;margin-top:18px;padding-top:14px;border-top:1px solid var(--line,#ddd)}
+.ths-lnk{border:0;background:none;padding:0;color:var(--acc,#1F3A5F);font:500 .9rem var(--sans,system-ui);cursor:pointer;text-decoration:none}
+.ths-lnk:hover{text-decoration:underline;text-underline-offset:3px}
+.ths-lnk.quiet{color:var(--ink2,#555)}.ths-lnk.danger{color:var(--bad,#B0281C)}
+.ths-lnk:disabled{opacity:.45;cursor:not-allowed;text-decoration:none}
+.ths-chip{display:inline-flex;align-items:center;height:24px;padding:0 10px;border-radius:99px;background:var(--acc2,#eef);color:var(--acc,#1F3A5F);font:500 .76rem var(--sans,system-ui);letter-spacing:.02em;vertical-align:middle}
+.ths-sec.preview .ths-row .btn{opacity:.5;pointer-events:none}
+.ths-sec .ths-row .btn{max-width:100%;white-space:normal;height:auto;min-height:42px;padding-top:8px;padding-bottom:8px;line-height:1.25}
+.ths-scrim{position:fixed;inset:0;background:rgba(20,18,15,.4);display:flex;align-items:center;justify-content:center;z-index:80;padding:20px;animation:ths-fade .15s ease-out}
+@keyframes ths-fade{from{opacity:0}}
+.ths-modal{background:var(--card,#fff);color:var(--ink,#111);border:1px solid var(--line,#ddd);border-radius:20px;width:100%;max-width:520px;max-height:calc(100dvh - 40px);overflow:auto;font-family:var(--sans,system-ui);box-shadow:0 24px 60px -20px rgba(0,0,0,.35)}
+.ths-modal.wide{max-width:760px}
+.ths-mh{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:26px 28px 6px}
+.ths-mh h2{font-family:var(--serif,Georgia,serif);font-weight:500;font-size:1.55rem;line-height:1.15;margin:0}
+.ths-x{width:36px;height:36px;border-radius:10px;border:0;background:none;color:var(--ink2,#555);display:grid;place-items:center;cursor:pointer;flex:none;margin:-4px -8px 0 0}
+.ths-x:hover{background:var(--bg2,#eee)}
+.ths-x .ths-ic{width:20px;height:20px}
+.ths-mb{padding:8px 28px 8px}
+.ths-mb p{margin:0 0 12px;line-height:1.55;color:var(--ink2,#555);font-size:.96rem}
+.ths-mb p b{color:var(--ink,#111);font-weight:500}
+.ths-mf{display:flex;justify-content:flex-end;gap:10px;padding:16px 28px 26px;flex-wrap:wrap}
+.ths-ic{width:18px;height:18px;flex:none}
+.ths-pair{display:grid;grid-template-columns:1fr auto;gap:28px;align-items:center;margin:10px 0 6px}
+.ths-codebox{min-width:0}
+.ths-label{font:500 .74rem var(--sans,system-ui);letter-spacing:.14em;text-transform:uppercase;color:var(--ink3,#777);margin-bottom:8px}
+.ths-code{font-family:var(--serif,Georgia,serif);font-size:3.1rem;line-height:1;letter-spacing:.06em;color:var(--ink,#111);font-variant-numeric:tabular-nums;white-space:nowrap}
+.ths-code span{display:inline-block;width:.45em}
+.ths-timer{display:flex;align-items:center;gap:10px;margin-top:14px;font-size:.86rem;color:var(--ink3,#777);font-variant-numeric:tabular-nums}
+.ths-bar{flex:1;height:3px;border-radius:3px;background:var(--bg2,#eee);overflow:hidden;max-width:180px}
+.ths-bar i{display:block;height:100%;background:var(--hl,var(--acc,#1F3A5F));transition:width 1s linear}
+.ths-steps{margin:18px 0 0;padding:0;list-style:none;counter-reset:s;font-size:.92rem;color:var(--ink2,#555)}
+.ths-steps li{counter-increment:s;display:flex;gap:10px;margin-bottom:7px;line-height:1.45}
+.ths-steps b{font-weight:500;color:var(--ink,#111)}
+.ths-steps li::before{content:counter(s);flex:none;width:20px;height:20px;border-radius:50%;background:var(--acc2,#eef);color:var(--acc,#1F3A5F);font-size:.74rem;font-weight:500;display:grid;place-items:center;margin-top:1px}
+.ths-qr{display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px 16px 12px;border:1px solid var(--line,#ddd);border-radius:16px;background:#fff}
+.ths-qr svg{display:block;border-radius:6px}
+.ths-qr .ths-lnk{font-size:.85rem;display:inline-flex;align-items:center;gap:6px;color:#1A1C20}
+.ths-qr small{font-size:.76rem;color:#6a665f;text-align:center;max-width:200px;line-height:1.35}
+.ths-note{display:flex;gap:10px;align-items:flex-start;font-size:.84rem;color:var(--ink3,#777);line-height:1.45;margin-top:18px;padding-top:14px;border-top:1px solid var(--line,#ddd)}
+.ths-note .ths-ic{width:16px;height:16px;margin-top:2px}
+.ths-done{display:flex;gap:12px;align-items:center;padding:14px 16px;border-radius:14px;background:var(--okbg,#e5f0e8);color:var(--ok,#2E7558);font-weight:500;margin-top:16px}
+.ths-wait{display:flex;gap:10px;align-items:center;font-size:.88rem;color:var(--ink3,#777);margin-top:16px}
+.ths-wait i{width:7px;height:7px;border-radius:50%;background:var(--acc,#1F3A5F);animation:ths-pulse 1.2s ease-in-out infinite}
+.ths-in{width:100%;height:68px;border:1px solid var(--line2,#ccc);border-radius:14px;background:var(--card,#fff);color:var(--ink,#111);text-align:center;font:500 2.1rem var(--serif,Georgia,serif);letter-spacing:.32em;padding:0 0 0 .32em;font-variant-numeric:tabular-nums}
+.ths-in::placeholder{color:var(--line2,#ccc);letter-spacing:.32em}
+.ths-in:focus{outline:2px solid color-mix(in srgb,var(--acc,#1F3A5F) 55%,transparent);outline-offset:1px;border-color:transparent}
+.ths-in.small{font:400 .95rem var(--sans,system-ui);letter-spacing:0;height:46px;text-align:left;padding:0 14px}
+.ths-in.small::placeholder{letter-spacing:0;color:var(--ink3,#888)}
+.ths-err{color:var(--bad,#B0281C);font-size:.88rem;margin-top:10px;min-height:1.3em}
+.ths-or{display:flex;align-items:center;gap:12px;margin:20px 0 14px;color:var(--ink3,#777);font-size:.8rem;letter-spacing:.12em;text-transform:uppercase}
+.ths-or::before,.ths-or::after{content:"";flex:1;height:1px;background:var(--line,#ddd)}
+.ths-two{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0 4px}
+.ths-ver{border:1px solid var(--line,#ddd);border-radius:16px;padding:16px 16px 14px;background:var(--bg,#f6f6f6);min-width:0}
+.ths-ver .ths-label{margin-bottom:6px}
+.ths-ver b{display:block;font-family:var(--serif,Georgia,serif);font-weight:500;font-size:1.2rem;line-height:1.2;color:var(--ink,#111)}
+.ths-ver small{display:block;color:var(--ink2,#555);font-size:.86rem;margin-top:6px;line-height:1.4}
+.ths-ver .ths-ic{width:22px;height:22px;color:var(--acc,#1F3A5F);margin-bottom:10px}
+.ths-busy{opacity:.6;pointer-events:none}
+@media (max-width:760px){
+  .ths-scrim{align-items:flex-end;padding:0}
+  .ths-modal{border-radius:22px 22px 0 0;max-height:94dvh;border-bottom:0;padding-bottom:env(safe-area-inset-bottom)}
+  .ths-mh{padding:22px 20px 4px}.ths-mb{padding:8px 20px}.ths-mf{padding:14px 20px 22px}
+  .ths-mf .btn{flex:1}
+  .ths-pair{grid-template-columns:1fr;gap:18px}
+  .ths-code{font-size:2.7rem}
+  .ths-qr{flex-direction:row;align-items:center;gap:14px;padding:12px}
+  .ths-qr .ths-qrside{display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+  .ths-qr small{text-align:left}
+  .ths-two{grid-template-columns:1fr}
+  .ths-sec .ths-row .btn{flex:1 1 100%}
+}
+@media (min-width:761px){.ths-qr .ths-qrside{display:contents}}
+`;
+
+  // ------------------------------------------------------------------ the sync controller
+  function create(A) {
+    const appId = A.appId, appName = A.appName || "the app", MK = A.storageKey + ".sync", url = String(A.url || "").replace(/\/+$/, "");
+    const cls = Object.assign({ pri: "btn pri", ghost: "btn ghost", danger: "btn ghost danger" }, A.cls || {});
+    const enabled = !!url && !A.demo, nowMs = () => Date.now();
+    let meta = null; try { meta = JSON.parse(LS.get(MK) || "null"); } catch (e) { meta = null; }
+    if (meta && !(meta.space && meta.key && meta.token)) meta = null;
+    const saveMeta = () => { if (meta) LS.set(MK, JSON.stringify(meta)); else LS.del(MK); };
+    let st = { s: meta ? (meta.off ? meta.off : "idle") : "off", err: "", at: meta ? meta.syncedAt || 0 : 0 };
+    let busy = false, again = false, applying = false, joiningNow = false, pushT = null, retryT = null, fails = 0, conflict = null, pollT = null, lastFocus = 0, pendingLink = null, started = false;
+    const did = (() => { let d = LS.get(A.storageKey + ".device"); if (!d) { d = b64url(rand(9)); LS.set(A.storageKey + ".device", d); } return d; })();
+
+    // a link opened on this device: remember it, and take the secrets out of the address bar at once
+    function takeLink() {
+      if (!root.location || !/#link=/.test(location.hash)) return null;
+      const lk = linkDecode(location.hash);
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) { }
+      return lk || { app: "" };
+    }
+    pendingLink = takeLink();
+
+    // -------------------------------------------------------------- transport
+    async function api(method, path, o = {}) {
+      const h = {};
+      if (o.token) h.Authorization = "Bearer " + o.token;
+      if (o.ifMatch !== undefined) h["If-Match"] = String(o.ifMatch);
+      if (o.body) h["Content-Type"] = "application/json";
+      const ctl = typeof AbortController === "function" ? new AbortController() : null, t = ctl && setTimeout(() => ctl.abort(), o.timeout || 20000);
+      let r;
+      try { r = await fetch(url + path, { method, headers: h, body: o.body ? JSON.stringify(o.body) : undefined, cache: "no-store", signal: ctl && ctl.signal }); }
+      catch (e) { const x = new Error("offline"); x.offline = true; throw x; }
+      finally { t && clearTimeout(t); }
+      let j = {}; try { j = await r.json(); } catch (e) { }
+      if (r.status >= 500 || r.status === 429 && !o.allow429) { const x = new Error(j.error || "server " + r.status); x.offline = r.status >= 500; x.status = r.status; x.j = j; throw x; }
+      return { status: r.status, j };
+    }
+
+    // -------------------------------------------------------------- status
+    function setStatus(s, err = "") { st.s = s; st.err = err; if (s === "synced") st.at = nowMs(); refresh(); }
+    const needsFix = () => ["conflict", "gone", "denied", "toolarge", "broken"].includes(st.s);
+    function ago(t) {
+      const d = Math.max(0, nowMs() - t) / 1000;
+      if (d < 45) return "just now"; if (d < 90) return "1 min ago"; if (d < 3600) return Math.round(d / 60) + " min ago";
+      if (d < 7200) return "1 hour ago"; if (d < 86400) return Math.round(d / 3600) + " hours ago"; return new Date(t).toLocaleDateString();
+    }
+    function pillText() {
+      if (needsFix()) return "Tap to fix";
+      if (st.s === "offline") return "Offline – will sync";
+      if (st.s === "syncing" || st.s === "pending") return "Syncing…";
+      return "Synced · " + ago(st.at || meta && meta.syncedAt || nowMs());
+    }
+    const pillState = () => needsFix() ? "fix" : st.s === "offline" ? "offline" : st.s === "syncing" || st.s === "pending" ? "syncing" : "ok";
+    function pillHTML() {
+      if (!enabled || !meta) return "";
+      return `<button type="button" class="ths-pill" data-ths-pill data-ths="pill" data-s="${pillState()}" aria-live="polite" title="${needsFix() ? "Sync needs you – tap" : "Tap to sync now"}"><i></i><span>${esc(pillText())}</span></button>`;
+    }
+    function refresh() {
+      if (typeof document === "undefined") return;
+      document.querySelectorAll("[data-ths-pill]").forEach(p => { p.dataset.s = pillState(); const sp = p.querySelector("span"); if (sp) sp.textContent = pillText(); });
+      document.querySelectorAll("[data-ths-section]").forEach(el => { el.outerHTML = sectionHTML(); });
+      const shells = document.querySelectorAll("[data-ths-pillslot]");
+      shells.forEach(s => { const want = !!(enabled && meta); if (want !== !!s.querySelector("[data-ths-pill]")) s.innerHTML = pillHTML(); });
+      if (A.onStatus) try { A.onStatus(st.s); } catch (e) { }
+    }
+
+    // -------------------------------------------------------------- core sync cycle
+    const localNow = () => String(A.getState());
+    async function envelopeFor(text, version) {
+      return seal(meta.key, appId, meta.space, version, JSON.stringify({ app: appId, at: meta.changedAt || nowMs(), dev: deviceName(), did, state: text }));
+    }
+    async function fetchRemote() {
+      const r = await api("GET", "/v1/space/" + meta.space, { token: meta.token });
+      if (r.status !== 200) return r;
+      let env;
+      try { env = JSON.parse(await open(meta.key, appId, meta.space, r.j.version, r.j.ciphertext)); }
+      catch (e) { return { status: -1 }; }
+      if (env.app !== appId || typeof env.state !== "string") return { status: -1 };
+      return { status: 200, version: r.j.version, updatedAt: r.j.updatedAt, env };
+    }
+    async function applyRemote(rem) {
+      applying = true;
+      try { await A.applyState(rem.env.state); } finally { applying = false; }
+      meta.base = rem.version; meta.baseHash = await sha256hex(localNow()); meta.syncedAt = nowMs(); meta.changedAt = 0; saveMeta();
+    }
+    async function push(text, hash, base) {
+      const v = base + 1, ct = await envelopeFor(text, v);
+      if (ct.length > MAX_CT) return { status: 413 };
+      const r = await api("PUT", "/v1/space/" + meta.space, { token: meta.token, ifMatch: base, body: { ciphertext: ct } });
+      if (r.status === 200) { meta.base = r.j.version; meta.baseHash = hash; meta.syncedAt = nowMs(); saveMeta(); }
+      return r;
+    }
+    function trouble(r) {
+      if (r.status === 404) { meta.off = "gone"; saveMeta(); setStatus("gone"); return true; }
+      if (r.status === 403 || r.status === 401) { setStatus("denied"); return true; }
+      if (r.status === 413) { setStatus("toolarge"); return true; }
+      if (r.status === -1) { setStatus("broken"); return true; }
+      return false;
+    }
+    async function cycle() {
+      if (!enabled || !meta || meta.off || joiningNow) return;
+      if (conflict) { setStatus("conflict"); return; }
+      if (busy) { again = true; return; }
+      busy = true; clearTimeout(retryT); clearTimeout(pushT); pushT = null;
+      if (st.s === "idle" || st.s === "pending") setStatus("syncing");
+      try {
+        const text = localNow(), h = await sha256hex(text), dirty = h !== meta.baseHash;
+        if (dirty) {
+          if (st.s !== "syncing") setStatus("syncing");
+          const r = await push(text, h, meta.base || 0);
+          if (r.status === 200) { fails = 0; setStatus("synced"); }
+          else if (r.status === 409) await reconcile(text, h);
+          else if (!trouble(r)) throw Object.assign(new Error("push " + r.status), { offline: false });
+        } else {
+          const r = await api("GET", "/v1/space/" + meta.space + "/version", { token: meta.token });
+          if (r.status === 200 && r.j.version === meta.base) { fails = 0; meta.syncedAt = nowMs(); saveMeta(); setStatus("synced"); }
+          else if (r.status === 200 && r.j.version < meta.base) { meta.base = r.j.version; meta.baseHash = ""; saveMeta(); again = true; }   // the server went backwards: never roll back, re-upload this device's copy
+          else if (r.status === 200) await reconcile(text, h);
+          else if (!trouble(r)) throw new Error("version " + r.status);
+        }
+      } catch (e) {
+        setStatus("offline", e.message);          // network down, server busy or rate-limited: keep the changes, try again later
+        retryT = setTimeout(cycle, BACKOFF[Math.min(fails++, BACKOFF.length - 1)]);
+      } finally {
+        busy = false;
+        if (again) { again = false; setTimeout(cycle, 0); }
+      }
+    }
+    // the server has a newer copy than the one this device last saw
+    async function reconcile(text, h) {
+      const rem = await fetchRemote();
+      if (rem.status !== 200) { if (!trouble(rem)) throw new Error("fetch " + rem.status); return; }
+      if (rem.version < (meta.base || 0)) { meta.base = rem.version; meta.baseHash = ""; saveMeta(); again = true; return; }
+      const dirty = h !== meta.baseHash, rh = await sha256hex(rem.env.state);
+      if (!dirty) { await applyRemote(rem); fails = 0; setStatus("synced"); return; }
+      if (rh === h) { meta.base = rem.version; meta.baseHash = h; meta.syncedAt = nowMs(); saveMeta(); fails = 0; setStatus("synced"); return; }
+      // both changed since the last sync: never pick one silently
+      conflict = { rem, localAt: meta.changedAt || nowMs() };
+      setStatus("conflict");
+      showConflict();
+    }
+
+    function changed() {
+      if (applying || joiningNow || !enabled || !meta || meta.off) return;
+      meta.changedAt = nowMs(); saveMeta();
+      if (!conflict && st.s !== "offline") setStatus("pending");
+      clearTimeout(pushT); pushT = setTimeout(cycle, DEBOUNCE);
+    }
+
+    // -------------------------------------------------------------- linking
+    async function ensureSpace() {
+      if (meta && !meta.off) return;
+      const s = newSecrets(), text = localNow();
+      const m = { v: 1, space: s.space, key: s.key, token: s.token, base: 0, baseHash: "", syncedAt: 0, changedAt: nowMs() };
+      const prev = meta; meta = m;
+      try {
+        const r = await push(text, await sha256hex(text), 0);
+        if (r.status !== 200) { meta = prev; throw Object.assign(new Error(r.status === 429 ? "busy" : "Couldn't start sync (" + r.status + ")"), { status: r.status }); }
+      } catch (e) { if (meta === m) meta = prev; throw e; }
+      saveMeta(); setStatus("synced"); schedulePoll();
+    }
+    async function makeCode() {
+      await ensureSpace();
+      const r = await api("POST", "/v1/pair", {});
+      if (r.status !== 200) throw new Error("code " + r.status);
+      const blob = await pairSeal(r.j.code, appId, { s: meta.space, k: meta.key, t: meta.token, a: appId });
+      const p = await api("PUT", "/v1/pair/" + r.j.code, { token: r.j.ticket, body: { blob } });
+      if (p.status !== 200) throw new Error("code " + p.status);
+      return { code: r.j.code, ticket: r.j.ticket, expiresAt: nowMs() + (r.j.ttl || 600000) };
+    }
+    function linkURL() {
+      const base = A.linkBase || (root.location ? location.href.split("#")[0] : "");
+      return base + "#link=" + linkEncode(appId, meta);
+    }
+    // join with a 6-digit code or a link; returns the secrets
+    async function secretsFrom(input) {
+      const raw = String(input || "").trim(), lk = linkDecode(raw);
+      if (lk) { if (lk.app !== appId) throw new Error(`That link is for a different app, not ${appName}.`); return lk; }
+      const code = raw.replace(/\D/g, "");
+      if (code.length !== 6) throw new Error("Enter the 6 digits shown on your other device.");
+      const r = await api("GET", "/v1/pair/" + code, { allow429: true });
+      if (r.status === 429) throw new Error(`Too many tries. Wait ${r.j.retryAfter > 90 ? Math.ceil(r.j.retryAfter / 60) + " minutes" : "a minute"} and try again.`);
+      if (r.status !== 200) throw new Error("That code didn't work. Codes work once and for 10 minutes – make a new one on your other device.");
+      let p; try { p = await pairOpen(code, appId, r.j.blob); } catch (e) { throw new Error("That code didn't work. Make a new one on your other device."); }
+      if (p.a !== appId) throw new Error(`That code is for a different app, not ${appName}.`);
+      return { space: p.s, key: p.k, token: p.t };
+    }
+    async function join(sec) {
+      if (joiningNow) throw new Error("Already linking – one moment.");
+      joiningNow = true;
+      try { return await joinInner(sec); } finally { joiningNow = false; }
+    }
+    async function joinInner(sec) {
+      while (busy) await new Promise(r => setTimeout(r, 50));      // let a running sync finish first
+      clearTimeout(pushT); clearTimeout(retryT); pushT = null;
+      const prev = meta;
+      meta = { v: 1, space: sec.space, key: sec.key, token: sec.token, base: 0, baseHash: "", syncedAt: 0, changedAt: 0 };
+      let rem;
+      try { rem = await fetchRemote(); } catch (e) { meta = prev; throw new Error("You seem to be offline. Connect and try again."); }
+      if (rem.status !== 200) {
+        meta = prev;
+        throw new Error(rem.status === 404 ? "Sync was turned off on the other device, so there's nothing to link to." : rem.status === 403 ? "That link doesn't open your data any more." : "Couldn't unlock the synced copy – make a new code on your other device.");
+      }
+      if (A.validate) { try { A.validate(rem.env.state); } catch (e) { meta = prev; throw new Error(`That isn't ${appName} data.`); } }
+      if (A.hasData && A.hasData()) LS.set(A.storageKey + ".before-link", JSON.stringify({ at: nowMs(), state: localNow() }));
+      conflict = null;
+      await applyRemote(rem);
+      fails = 0; setStatus("synced"); schedulePoll();
+      return rem;
+    }
+    function unlink() { meta = null; conflict = null; saveMeta(); clearTimeout(pushT); clearTimeout(retryT); setStatus("off"); }
+    async function erase() {
+      if (!meta) return;
+      const r = await api("DELETE", "/v1/space/" + meta.space, { token: meta.token });
+      if (r.status !== 200 && r.status !== 404) throw new Error("erase " + r.status);
+      unlink();
+    }
+
+    // -------------------------------------------------------------- triggers
+    function schedulePoll() {
+      if (pollT || !enabled || typeof setInterval !== "function") return;
+      pollT = setInterval(() => { if (meta && !meta.off && (typeof document === "undefined" || !document.hidden)) cycle(); }, POLL);
+    }
+    function start() {
+      if (started) return; started = true;
+      if (typeof document !== "undefined") {
+        injectCSS();
+        document.addEventListener("click", onClick);
+        document.addEventListener("input", onInput);
+        document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); else if (pushT) { clearTimeout(pushT); cycle(); } });
+        root.addEventListener("focus", wake);
+        root.addEventListener("online", () => { fails = 0; wake(true); });
+        root.addEventListener("hashchange", () => { const lk = takeLink(); if (lk) linkPrompt(lk); });   // link opened in a tab that already shows the app
+        setInterval(() => { if (st.s === "synced") refresh(); }, 30000);
+      }
+      if (enabled && meta && !meta.off) { schedulePoll(); cycle(); }
+      if (pendingLink) setTimeout(() => linkPrompt(pendingLink), 0);
+      refresh();
+    }
+    function wake(force) { const t = nowMs(); if (!force && t - lastFocus < 2000) return; lastFocus = t; cycle(); }
+
+    // -------------------------------------------------------------- UI: dialogs
+    let dlg = null, dlgKind = "", codeT = null, codeState = null;
+    function injectCSS() { if (document.getElementById("ths-css")) return; const s = document.createElement("style"); s.id = "ths-css"; s.textContent = CSS; document.head.appendChild(s); }
+    function dialog(kind, title, body, foot = "", o = {}) {
+      closeDialog();
+      const el = document.createElement("div");
+      el.className = "ths-scrim"; el.dataset.thsDialog = kind;
+      el.innerHTML = `<div class="ths-modal ${o.wide ? "wide" : ""}" role="dialog" aria-modal="true" aria-label="${esc(title)}"><div class="ths-mh"><h2>${esc(title)}</h2>${o.noClose ? "" : `<button class="ths-x" data-ths="close" aria-label="Close">${ic("x")}</button>`}</div><div class="ths-mb">${body}</div>${foot ? `<div class="ths-mf">${foot}</div>` : ""}</div>`;
+      if (!o.noClose) el.addEventListener("click", e => { if (e.target === el) closeDialog(); });
+      document.body.appendChild(el); dlg = el; dlgKind = kind;
+      const f = el.querySelector("[autofocus]"); if (f) setTimeout(() => f.focus(), 60);
+      return el;
+    }
+    function closeDialog() {
+      if (dlgKind === "link" && codeState && !codeState.used && !codeState.expired) api("DELETE", "/v1/pair/" + codeState.code, { token: codeState.ticket }).catch(() => { });
+      clearInterval(codeT); codeT = null; codeState = null;
+      if (dlg) { dlg.remove(); dlg = null; dlgKind = ""; }
+    }
+    if (typeof document !== "undefined") document.addEventListener("keydown", e => { if (e.key === "Escape" && dlg && dlgKind !== "conflict") closeDialog(); });
+    const b = (label, act, c = cls.ghost, extra = "") => `<button type="button" class="${c}" data-ths="${act}" ${extra}>${label}</button>`;
+    function toast(m) { if (A.toast) A.toast(m); }
+    function errText(e) { return e && e.offline ? "You seem to be offline. Connect to the internet and try again." : e && e.status === 429 ? "Too many tries right now. Wait a few minutes and try again." : (e && e.message) || "Something went wrong. Try again."; }
+
+    async function openLink() {
+      if (!enabled) return;
+      const el = dialog("link", "Link another device", `<div class="ths-wait"><i></i>Making a code…</div>`, "", { wide: true });
+      let c;
+      try { c = await makeCode(); }
+      catch (e) { if (dlg === el) el.querySelector(".ths-mb").innerHTML = `<p>${esc(errText(e))}</p>`; refresh(); return; }
+      if (dlg !== el) { api("DELETE", "/v1/pair/" + c.code, { token: c.ticket }).catch(() => { }); return; }
+      codeState = { ...c, used: false, expired: false };
+      const link = linkURL(), digits = c.code.slice(0, 3) + "<span></span>" + c.code.slice(3);
+      el.querySelector(".ths-mb").innerHTML = `
+        <div class="ths-pair">
+          <div class="ths-codebox">
+            <div class="ths-label">Your code</div>
+            <div class="ths-code" data-ths-code="${c.code}" aria-label="Code ${c.code.split("").join(" ")}">${digits}</div>
+            <div class="ths-timer"><span data-ths-left></span><span class="ths-bar"><i data-ths-bar style="width:100%"></i></span></div>
+            <ol class="ths-steps"><li><span>Open ${esc(appName)} on your other device.</span></li><li><span>Choose <b>Already use it on another device?</b> on the welcome screen – or <b>I already use it on another device</b> in Settings.</span></li><li><span>Enter this code. It works once.</span></li></ol>
+          </div>
+          <div class="ths-qr">${QR.svg(link, 168)}<div class="ths-qrside"><small>Or scan with the other device's camera</small><button type="button" class="ths-lnk" data-ths="copyLink">${ic("copy")}Copy link</button></div></div>
+        </div>
+        <div data-ths-linkstate class="ths-wait"><i></i>Waiting for your other device…</div>
+        <div class="ths-note">${ic("lock")}<span>Your data is locked on this device before it's sent – the server only ever sees scrambled text. Only show this code or QR to your own devices. Installed it on an iPhone home screen? Enter the code inside the app there – the camera opens Safari instead.</span></div>`;
+      el.dataset.link = link;
+      tickCode();
+      codeT = setInterval(tickCode, 1000);
+    }
+    let polling = 0;
+    async function tickCode() {
+      if (!codeState || !dlg) return;
+      const left = Math.max(0, codeState.expiresAt - nowMs()), m = Math.floor(left / 60000), s = Math.floor(left / 1000) % 60;
+      const L = dlg.querySelector("[data-ths-left]"), B = dlg.querySelector("[data-ths-bar]");
+      if (L) L.textContent = left > 0 ? `Expires in ${m}:${String(s).padStart(2, "0")}` : "Expired";
+      if (B) B.style.width = (left / 600000 * 100).toFixed(1) + "%";
+      if (left <= 0 && !codeState.used) {
+        codeState.expired = true; clearInterval(codeT);
+        const ls = dlg.querySelector("[data-ths-linkstate]");
+        if (ls) { ls.className = "ths-wait"; ls.innerHTML = `This code has expired. ${b("Make a new code", "link", "ths-lnk")}`; }
+        const cd = dlg.querySelector(".ths-code"); if (cd) cd.style.opacity = ".3";
+        return;
+      }
+      if (++polling % 3 !== 0) return;          // ask the server every 3 s whether the code was used
+      try {
+        const r = await api("GET", `/v1/pair/${codeState.code}/status`, { token: codeState.ticket });
+        if (codeState && r.status === 200 && r.j.state === "used") {
+          codeState.used = true; clearInterval(codeT);
+          const ls = dlg && dlg.querySelector("[data-ths-linkstate]");
+          if (ls) { ls.className = "ths-done"; ls.innerHTML = `${ic("check")}<span>Linked – your other device now has everything from this one.</span>`; }
+          const cd = dlg && dlg.querySelector(".ths-timer"); if (cd) cd.style.visibility = "hidden";
+        }
+      } catch (e) { }
+    }
+    function openJoin() {
+      if (!enabled) return;
+      const has = A.hasData && A.hasData();
+      dialog("join", "Link this device", `
+        <p>On the device that already has your data, open <b>Settings › Your devices › Link another device</b>. Then enter the 6-digit code it shows.</p>
+        <label class="ths-label" for="thsCode" style="display:block;margin-top:18px">6-digit code</label>
+        <input id="thsCode" class="ths-in" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000000" autofocus aria-describedby="thsErr">
+        <div class="ths-err" id="thsErr" role="alert"></div>
+        <div class="ths-or">or</div>
+        <p style="margin:0">Scan the QR code it shows with this device's camera – or paste the copied link here:</p>
+        <input id="thsLinkIn" class="ths-in small" placeholder="Paste the link" autocomplete="off" spellcheck="false">
+        ${has ? `<div class="ths-note">${ic("alert")}<span>What's on this device now is replaced by your other device's data. A copy of it is kept on this device just in case.</span></div>` : ""}`,
+        `${b("Cancel", "close")}${b("Link this device", "joinGo", cls.pri, "disabled")}`);
+    }
+    function onInput(e) {
+      if (!dlg) return;
+      if (e.target.id === "thsCode") {
+        const d = e.target.value.replace(/\D/g, "").slice(0, 6); if (e.target.value !== d) e.target.value = d;
+        const go = dlg.querySelector('[data-ths="joinGo"]'); if (go) go.disabled = d.length !== 6;
+        dlg.querySelector("#thsErr").textContent = "";
+        if (d.length === 6 && e.inputType !== "deleteContentBackward") doJoin(d);
+      }
+      if (e.target.id === "thsLinkIn") {
+        const lk = linkDecode(e.target.value);
+        const go = dlg.querySelector('[data-ths="joinGo"]'); if (go) go.disabled = !lk;
+        if (lk) doJoin(e.target.value);
+      }
+    }
+    let joining = false;
+    async function doJoin(input) {
+      if (joining || !dlg) return; joining = true;
+      const el = dlg, err = el.querySelector("#thsErr"), go = el.querySelector('[data-ths="joinGo"]'), mb = el.querySelector(".ths-mb");
+      if (go) { go.disabled = true; go.textContent = "Linking…"; }
+      mb.classList.add("ths-busy");
+      try {
+        const sec = await secretsFrom(input);
+        await join(sec);
+        closeDialog();
+        toast(`Linked – this device now shows your ${esc(appName)} from your other device.`);
+      } catch (e) {
+        if (dlg === el) {
+          mb.classList.remove("ths-busy");
+          if (err) err.textContent = errText(e);
+          if (go) { go.textContent = "Link this device"; go.disabled = false; }
+          const ci = el.querySelector("#thsCode"); if (ci && /code/i.test(errText(e))) { ci.select(); }
+        }
+      } finally { joining = false; }
+    }
+    function linkPrompt(lk) {
+      if (!enabled) return;
+      if (!lk || lk.app !== appId) { toast("That link isn't for this app."); return; }
+      if (meta && meta.space === lk.space && !meta.off) { toast("This device is already linked."); return; }
+      const has = A.hasData && A.hasData();
+      dialog("linkok", "Link this device?", `<p>This device will show your ${esc(appName)} from your other device, and changes on either one will show up on both.</p>${has ? `<p><b>What's on this device now is replaced.</b> A copy is kept on this device just in case.</p>` : ""}<div class="ths-err" id="thsErr" role="alert"></div>`,
+        `${b("Not now", "close")}${b("Link this device", "linkGo", cls.pri)}`);
+      dlg._link = lk;
+    }
+    const fmtTime = t => { if (!t) return "–"; const d = new Date(t), now = new Date(), same = d.toDateString() === now.toDateString(), y = new Date(now - 864e5).toDateString() === d.toDateString();
+      const hm = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); return same ? "today, " + hm : y ? "yesterday, " + hm : d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", " + hm; };
+    function showConflict() {
+      if (!conflict || typeof document === "undefined") return;
+      const c = conflict, loc = localNow(), dsc = s => { try { return A.describe ? A.describe(s) : ""; } catch (e) { return ""; } };
+      dialog("conflict", "Two versions", `
+        <p>${esc(appName)} was changed on this device and on another one before they could sync. Which version do you want to keep?</p>
+        <div class="ths-two">
+          <div class="ths-ver">${ic("devices")}<div class="ths-label">This device</div><b>Changed ${esc(fmtTime(c.localAt))}</b><small>${esc(dsc(loc))}</small></div>
+          <div class="ths-ver">${ic("phone")}<div class="ths-label">Your ${esc(c.rem.env.dev && c.rem.env.dev !== deviceName() ? c.rem.env.dev : "other device")}</div><b>Changed ${esc(fmtTime(c.rem.env.at || c.rem.updatedAt))}</b><small>${esc(dsc(c.rem.env.state))}</small></div>
+        </div>
+        <p style="margin-top:14px;font-size:.88rem">The one you don't keep is saved on this device as a backup. ${b("Download both as backup files", "both", "ths-lnk")}</p>`,
+        `${b("Keep this device's", "keepLocal")}${b("Use the other device's", "useRemote", cls.pri)}`, { wide: true, noClose: true });
+    }
+    async function resolve(which) {
+      const c = conflict; if (!c) return closeDialog();
+      const loc = localNow();
+      LS.set(A.storageKey + ".sync-discarded", JSON.stringify({ at: nowMs(), from: which === "local" ? "other device" : "this device", state: which === "local" ? c.rem.env.state : loc }));
+      conflict = null; closeDialog();
+      if (which === "remote") { await applyRemote(c.rem); setStatus("synced"); toast("Using the other device's version."); }
+      else { meta.base = c.rem.version; meta.baseHash = ""; saveMeta(); toast("Keeping this device's version."); }
+      cycle();
+    }
+    function download(name, text) {
+      const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([text], { type: "application/json" })); a.download = name;
+      document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    }
+    function showFix() {
+      if (st.s === "conflict") return showConflict();
+      if (st.s === "gone") return dialog("fix", "Sync was turned off", `<p>Sync was turned off on another device, and the copy on the server was erased. This device still has everything it had.</p>`,
+        `${b("Stop syncing here", "unlinkNow")}${b("Sync from this device again", "restart", cls.pri)}`);
+      if (st.s === "toolarge") return dialog("fix", "Too much to sync", `<p>Your ${esc(appName)} data has grown larger than sync can carry. Everything is still saved on this device. Download a backup to move it instead.</p>`, b("OK", "close", cls.pri));
+      return dialog("fix", "Sync can't open your data", `<p>This device's sync keys don't match the copy on the server any more – probably sync was reset from another device. Everything is still saved here.</p><p>Unlink this device, then link it again from your other device.</p>`,
+        `${b("Cancel", "close")}${b("Unlink this device", "unlinkNow", cls.pri)}`);
+    }
+    async function onClick(e) {
+      const t = e.target.closest && e.target.closest("[data-ths]"); if (!t) return;
+      e.preventDefault(); e.stopPropagation();
+      const a = t.dataset.ths;
+      if (a === "close") return closeDialog();
+      if (a === "pill") { if (needsFix()) return showFix(); fails = 0; return cycle(); }
+      if (a === "link") return openLink();
+      if (a === "join") return openJoin();
+      if (a === "joinGo") { const ci = dlg.querySelector("#thsCode"), li = dlg.querySelector("#thsLinkIn"); return doJoin(li && li.value.trim() ? li.value : ci ? ci.value : ""); }
+      if (a === "linkGo") {
+        const lk = dlg._link, el = dlg; t.disabled = true; t.textContent = "Linking…";
+        try { await join(lk); closeDialog(); toast(`Linked – this device now shows your ${esc(appName)} from your other device.`); }
+        catch (err) { if (dlg === el) { el.querySelector("#thsErr").textContent = errText(err); t.disabled = false; t.textContent = "Link this device"; } }
+        return;
+      }
+      if (a === "copyLink") {
+        const l = dlg && dlg.dataset.link; if (!l) return;
+        try { await navigator.clipboard.writeText(l); t.innerHTML = ic("check") + "Copied"; } catch (err) { prompt("Copy this link:", l); }
+        return;
+      }
+      if (a === "now") { fails = 0; await cycle(); if (st.s === "synced") toast("Synced."); return; }
+      if (a === "unlink") return dialog("unlink", "Unlink this device?", `<p>This device keeps everything it has now, but stops syncing. Your other devices keep syncing with each other.</p>`, `${b("Cancel", "close")}${b("Unlink", "unlinkNow", cls.pri)}`);
+      if (a === "unlinkNow") { closeDialog(); unlink(); toast("This device is unlinked. Everything it had is still here."); return; }
+      if (a === "erase") return dialog("erase", "Turn off sync and erase?", `<p>This erases the locked copy on the server and turns sync off on <b>all</b> your devices. Each device keeps what it has now.</p><p>You can link them again later.</p><div class="ths-err" id="thsErr" role="alert"></div>`, `${b("Cancel", "close")}${b("Turn off and erase", "eraseNow", cls.danger)}`);
+      if (a === "eraseNow") {
+        const el = dlg; t.disabled = true;
+        try { await erase(); closeDialog(); toast("Sync is off and the server copy is erased."); }
+        catch (err) { if (dlg === el) { el.querySelector("#thsErr").textContent = errText(err); t.disabled = false; } }
+        return;
+      }
+      if (a === "restart") { closeDialog(); meta = null; saveMeta(); try { await ensureSpace(); toast("Syncing from this device again – link your other devices to it."); } catch (err) { setStatus("off"); toast(errText(err)); } return; }
+      if (a === "keepLocal") return resolve("local");
+      if (a === "useRemote") return resolve("remote");
+      if (a === "both" && conflict) { const d = new Date().toISOString().slice(0, 10); download(`${appId}-this-device-${d}.json`, localNow()); setTimeout(() => download(`${appId}-other-device-${d}.json`, conflict.rem.env.state), 400); return; }
+    }
+
+    // -------------------------------------------------------------- UI: settings section
+    function sectionHTML() {
+      const wrap = (inner, c = "") => `<div class="ths-sec ${c}" data-ths-section>${inner}</div>`;
+      const intro = `<p class="ths-p">Use ${esc(appName)} on your phone and your computer. A change on one shows up on the other – locked on this device before it leaves, so no one else can read it. No account needed.</p>`;
+      if (A.demo) return wrap(`${intro}<div class="ths-row">${b(ic("link") + "Link another device", "noop", cls.ghost, "disabled")}${b("I already use it on another device", "noop", cls.ghost, "disabled")}</div><p class="ths-p" style="margin:14px 0 0"><span class="ths-chip">Works in the full app</span></p>`, "preview");
+      if (!url) return wrap(`${intro}<p class="ths-p" style="margin:0"><span class="ths-chip">Coming soon</span></p>`);
+      if (!meta) return wrap(`${intro}<div class="ths-row">${b(ic("link") + "Link another device", "link")}${b("I already use it on another device", "join")}</div>`);
+      const fix = needsFix() || meta.off;
+      const head = fix ? `<div class="ths-state fix">${ic("alert")}<div><b>${st.s === "conflict" ? "Two versions to choose from" : st.s === "gone" || meta.off ? "Sync was turned off on another device" : st.s === "toolarge" ? "Too much to sync" : "Sync can't open your data"}</b><small><button type="button" class="ths-lnk" data-ths="pill">Fix it</button></small></div></div>`
+        : `<div class="ths-state">${ic("lock")}<div><b>${st.s === "offline" ? "Offline – changes will sync when you're back" : st.s === "syncing" || st.s === "pending" ? "Syncing…" : "Synced " + ago(st.at || meta.syncedAt || nowMs())}</b><small>End-to-end encrypted · this device: ${esc(deviceName())}</small></div></div>`;
+      return wrap(`${head}<div class="ths-row">${b(ic("link") + "Link another device", "link")}${b(ic("sync") + "Sync now", "now")}</div>
+        <div class="ths-quiet">${b("Unlink this device", "unlink", "ths-lnk quiet")}${b("Turn off sync and erase the server copy", "erase", "ths-lnk danger")}</div>`);
+    }
+
+    return {
+      start, changed, cycle, pillHTML, sectionHTML, openJoin, openLink, refresh,
+      get status() { return st.s; }, get linked() { return !!meta && !meta.off && !joiningNow; }, get enabled() { return enabled; },
+      // for tests
+      _meta: () => meta, _join: async input => join(await secretsFrom(input)), _makeCode: makeCode, _unlink: unlink, _erase: erase, _linkURL: () => linkURL()
+    };
+  }
+
+  const API = { create, seal, open, pairSeal, pairOpen, newSecrets, linkEncode, linkDecode, sha256hex, qr: QR, PBKDF2_ITER, VERSION };
+  root.THSync = API;
+  if (typeof module !== "undefined" && module.exports) module.exports = API;
+})(typeof window !== "undefined" ? window : globalThis);
+
+/* Haven engine: dates, recurrence, safe-to-spend, look-ahead, debt, goals. No DOM. */
 const E = (() => {
   // ------------------------------------------------------------ dates (local, 'YYYY-MM-DD')
   const pad = n => String(n).padStart(2, "0");
@@ -679,7 +1464,7 @@ function migrate(s) {
   return out;
 }
 let saveT = null;
-function flush() { if (DEMO) return; clearTimeout(saveT); saveT = null; try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast("Couldn't save – storage is full or blocked."); } }
+function flush(quiet) { if (DEMO) return; clearTimeout(saveT); saveT = null; try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast("Couldn't save – storage is full or blocked."); return; } if (!quiet && window.SYNC_NOTIFY) window.SYNC_NOTIFY(); }
 function save() { if (DEMO) return; clearTimeout(saveT); saveT = setTimeout(flush, 60); }
 addEventListener("pagehide", () => saveT && flush());
 document.addEventListener("visibilitychange", () => { if (document.hidden && saveT) flush(); });
@@ -722,6 +1507,7 @@ function greet() { const h = new Date(now()).getHours(); return h < 5 ? "Hello, 
 
 // ------------------------------------------------------------ icons (stroke)
 const IP = {
+  devices: '<rect x="2.5" y="5" width="13" height="10" rx="1.6"/><path d="M6 18.5h6"/><rect x="16.5" y="8" width="5" height="11" rx="1.3"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   cal: '<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M3 10h18M8 3v4M16 3v4"/>',
   bill: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
@@ -836,7 +1622,7 @@ function shell(inner) {
   const side = `<aside class="side"><div class="brand"><div class="logo">H</div><div><b>Haven</b><span>ADHD BUDGET PLANNER</span></div></div>
     <button class="btn pri addbtn" data-act="add">${ic("plus")} Log a spend</button>
     ${NAV.map(([g, items]) => `<div class="navlabel caps">${g}</div>` + items.map(([id, label, icon]) => `<a class="nav ${r === id ? "on" : ""}" href="#/${id}">${ic(icon)}${label}${nb[id] ? `<span class="badge ${nb[id][1]}">${nb[id][0]}</span>` : ""}</a>`).join("")).join("")}
-    <div style="flex:1"></div><div class="tiny faint" style="padding:10px 12px">${DEMO ? "Demo · nothing is saved" : "Saved on this device · works offline"}</div></aside>`;
+    <div style="flex:1"></div><div class="tiny faint" style="padding:10px 12px">${DEMO ? "Demo · nothing is saved" : SYNC.linked ? "Synced between your devices · works offline" : "Saved on this device · works offline"}</div></aside>`;
   const tab = (id, label, icon) => `<a class="${r === id ? "on" : ""}" href="#/${id}">${ic(icon)}<span>${label}</span></a>`;
   const tabbar = `<nav class="tabbar">${tab("today", "Today", "sun")}${tab("month", "Month", "cal")}<button class="fab" data-act="add" aria-label="Log a spend">${ic("plus")}</button>${tab("bills", "Bills", "bill")}<a href="javascript:void 0" data-act="moreMenu" class="${["today", "month", "bills"].includes(r) ? "" : "on"}">${ic("more")}<span>More</span></a></nav>`;
   const banner = DEMO ? `<div class="banner">You're trying the free demo – play around, nothing is saved. <a href="${esc(window.HAVEN_SHOP || "#")}" target="_blank" rel="noopener">Get the full app →</a></div>` : "";
@@ -850,7 +1636,7 @@ function navBadges() {
   if (ready) b.wish = [ready, ""];
   return b;
 }
-function pageTop(title, sub, acts = "") { return `<div class="topbar"><div><div class="caps" style="margin-bottom:6px">${sub}</div><h1>${title}</h1></div><div class="acts">${acts}</div></div>`; }
+function pageTop(title, sub, acts = "") { return `<div class="topbar"><div><div class="caps" style="margin-bottom:6px">${sub}</div><h1>${title}</h1></div><div class="acts"><span data-ths-pillslot>${SYNC.pillHTML()}</span>${acts}</div></div>`; }
 
 // =========================================================== TODAY
 function vToday() {
@@ -902,7 +1688,7 @@ function nextStep(s) {
   else if (s.fresh === "old" && !soon.length) { ico = "wallet"; title = "Quick balance check?"; txt = `It's been ${s.age} days. No catching up needed – tick any bills that went out, then tell Haven today's balance.`; btn = `<button class="btn pri sm" data-act="minute">Start the money minute</button>`; }
   else if (remDue().length) { const r = remDue()[0], T = RT[r.type] || RT.other, d = E.diff(t, r.date); ico = "bell"; title = `${T[1]}: ${esc(r.name)}`; txt = `${d < 0 ? "Was due " + rel(r.date) : "Due " + rel(r.date)}${r.amount ? " · " + fmt(r.amount) : ""}. Sort it now and it's off your mind.`; btn = `<button class="btn pri sm" data-act="remDone" data-id="${r.id}">${T[2]}</button><button class="btn sm" data-act="goto" data-r="remember">Open list</button>`; }
   else if (ready.length) { ico = "pause"; title = `Still want ${esc(ready[0].name)}?`; txt = `The cool-off is over. Decide now – both answers are fine.`; btn = `<button class="btn pri sm" data-act="goto" data-r="wish">Decide</button>`; }
-  else if (!DEMO && S.expenses.length >= 15 && (!S.lastBackup || E.diff(S.lastBackup, t) > 30)) { ico = "down"; title = "Time for a little backup"; txt = "Your data lives only on this device. One tap saves a copy you can keep in Files, Drive or your email."; btn = `<button class="btn pri sm" data-act="backup">Download backup</button>`; }
+  else if (!DEMO && !SYNC.linked && S.expenses.length >= 15 && (!S.lastBackup || E.diff(S.lastBackup, t) > 30)) { ico = "down"; title = "Time for a little backup"; txt = "Your data lives only on this device. One tap saves a copy you can keep in Files, Drive or your email."; btn = `<button class="btn pri sm" data-act="backup">Download backup</button>`; }
   else if (cancelSoon().length) { const b = cancelSoon()[0], d = E.diff(t, b.cancelBy); ico = "bell"; title = `Cancel ${esc(b.name)} by ${d === 0 ? "today" : dshort(b.cancelBy)}?`; txt = `Your cancel-by date is ${d === 0 ? "today" : "in " + d + " day" + (d > 1 ? "s" : "")}. Still using it? Then you're fine – if not, cancel now.`; btn = `<button class="btn pri sm" data-act="goto" data-r="subs">Open subscriptions</button>`; }
   else if (soon.length) { ico = "bell"; title = `${esc(soon[0].bill.name)} is due ${rel(soon[0].date)}`; txt = `${fmt(soon[0].amount)} – already held back from your number. Tick it once it's paid.`; btn = `<button class="btn sm" data-act="pay" data-k="${esc(soon[0].key)}">Mark paid</button>`; }
   return `<div class="card next" style="order:2"><div class="ico">${ic(ico)}</div><div class="grow"><div class="caps" style="margin-bottom:3px">One thing right now</div><h3>${title}</h3><div class="sub" style="margin-top:3px">${txt}</div>${btn ? `<div class="row wrap" style="margin-top:12px">${btn}</div>` : ""}</div></div>`;
@@ -1124,10 +1910,10 @@ function vSettings() {
     <div class="card"><h2>Basics</h2><div class="frow" style="margin-top:14px"><div class="field"><label>Your name</label><input class="inp" data-set="name" value="${esc(st.name)}" placeholder="optional"></div><div class="field"><label>Currency</label><select class="inp" data-set="currency">${curs.map(c => `<option ${c === st.currency ? "selected" : ""}>${c}</option>`).join("")}</select></div></div>
       <div class="field"><label>Week starts on</label><div class="seg"><button class="${st.weekStart === 1 ? "on" : ""}" data-act="ws" data-v="1">Monday</button><button class="${st.weekStart === 0 ? "on" : ""}" data-act="ws" data-v="0">Sunday</button></div></div>
       <div class="row wrap" style="gap:8px"><button class="btn sm" data-act="accounts">${ic("wallet")} Accounts</button><button class="btn sm" data-act="cats">Categories & budgets</button><button class="btn sm" data-act="quickEdit">One-tap buttons</button></div></div></div>
-    <div class="col"><div class="card"><h2>Your data</h2><div class="sub" style="margin:4px 0 12px">Everything stays on this device – no account, no bank login, no tracking. Make a backup now and then.</div>
+    <div class="col"><div class="card"><h2>Your data</h2><div class="sub" style="margin:4px 0 12px">${SYNC.linked ? "Saved on this device and synced, locked, to your linked devices. No account, no bank login, no tracking." : "Everything stays on this device – no account, no bank login, no tracking. Make a backup now and then."}</div>
       <div class="row wrap" style="gap:8px"><button class="btn pri sm" data-act="backup">${ic("down")} Download backup</button><button class="btn sm" data-act="ics">${ic("cal")} Bills to my calendar</button></div>
       <div class="tiny muted" style="margin-top:10px">${S.lastBackup ? "Last backup " + rel(S.lastBackup) : "No backup yet."}</div><input type="file" id="restoreFile" accept=".json,application/json" class="hidden"></div>
-    ${installCard()}${transferCard()}
+    <div class="card" id="devices"><h2>Your devices</h2><div style="margin-top:10px">${SYNC.sectionHTML()}</div></div>${installCard()}
     <div class="card"><h2>Start over</h2><div class="row wrap" style="gap:8px;margin-top:10px"><button class="btn sm" data-act="sample">Try with sample data</button><button class="btn sm danger" data-act="reset">Erase everything</button></div></div></div></div>`;
 }
 
@@ -1453,6 +2239,28 @@ function transferCard() {
 const SUBS_ACT = {
   newSub: () => billModal(null, "sub"), install: installApp, shareBackup
 };
+
+/* device sync: the small Haven adapter for TrueHaven Sync (planner2027/sync/client/sync.js, inlined by build.py) */
+let syncLinked = null;
+const SYNC = THSync.create({
+  appId: "haven", appName: "Haven", storageKey: KEY, url: window.HAVEN_SYNC_URL || "", demo: DEMO,
+  cls: { pri: "btn pri", ghost: "btn", danger: "btn danger" },
+  // the saved state exactly as it sits in localStorage (pending saves are written first, without re-notifying)
+  getState: () => { if (saveT) flush(true); let s = null; try { s = localStorage.getItem(KEY); } catch (e) { } return s || JSON.stringify(S); },
+  // a remote copy replaces the whole state through the normal load path (migrate), like restoring a backup
+  applyState: json => { S = migrate(JSON.parse(json)); ob = { step: 0, bills: [] }; flush(true); render(); },
+  onChange: notify => { window.SYNC_NOTIFY = notify; },
+  validate: json => { migrate(JSON.parse(json)); },
+  describe: json => { const d = JSON.parse(json), n = k => Array.isArray(d[k]) ? d[k].length : 0, pl = (x, w) => x + " " + w + (x === 1 ? "" : "s");
+    return d.setup === false && !n("expenses") ? "Not set up yet" : `${pl(n("bills"), "bill")} · ${pl(n("expenses"), "spend")}`; },
+  hasData: () => !!(S.setup || S.expenses.length),
+  toast: m => toast(m),
+  onStatus: () => { relink(); setTimeout(relink, 700); }
+});
+// "linked" flips a moment after the status does, so re-check: the sidebar text and reminders follow it
+function relink() { const l = SYNC.linked; if (syncLinked !== null && l !== syncLinked) { syncLinked = l; if (!document.querySelector(".scrim")) rerender(); } syncLinked = l; }
+window.SYNC_NOTIFY = () => SYNC.changed();
+setTimeout(() => SYNC.start(), 0);
 
 /* Haven actions, modals, onboarding, init */
 function render() {
@@ -1983,6 +2791,7 @@ function vOnboard() {
     <div class="card" style="margin:20px 0">${fld("What should Haven call you?", `<input class="inp" id="ob_name" value="${esc(st.name)}" placeholder="optional">`)}${fld("Currency", sel("ob_cur", ["USD", "EUR", "GBP", "CAD", "AUD", "NZD", "CHF", "SEK", "NOK", "DKK", "PLN", "ZAR", "INR", "SGD", "JPY", "MXN", "BRL"].map(c => [c, c]), st.currency).replace('name="ob_cur"', 'id="ob_cur"'))}
     <div class="field"><label>Pick your color</label><div class="row wrap" style="gap:8px">${th.map(n => `<button class="pill ${st.theme === n ? "on" : ""}" data-act="obTheme" data-t="${n}"><span class="dot" style="background:${sw[n]}"></span>${n}</button>`).join("")}</div></div></div>
     <div class="row sb"><button class="link" data-act="sample">Just look around with sample data</button><button class="btn pri" data-act="obNext">Let's start →</button></div>
+    ${SYNC.enabled ? `<button class="link walready" data-ths="join">${ic("devices")}Already use Haven on another device?</button>` : ""}
     ${DEMO ? "" : `<div class="row" style="margin-top:14px"><button class="link" data-act="restore">${ic("up").replace("<svg", '<svg width="14" height="14" style="vertical-align:-2px"')} Restore from a backup</button><input type="file" id="restoreFile" accept=".json,application/json" class="hidden"></div>`}`;
   if (ob.step === 1) body = `<div class="caps">Step 1 · Your money now</div><h1 style="margin:6px 0 10px">What's in your bank?</h1><p class="muted" style="margin-top:0">Open your banking app and type what's in the account you spend from. Rough is fine.</p>
     <div class="card" style="margin:20px 0">${fld("Everyday account", `<input class="inp" id="ob_bal" inputmode="decimal" placeholder="0.00" value="${S.balance.ts ? S.balance.amount : ""}">`)}<div class="sub tiny">You can add cash or a second card later.</div></div>
@@ -2038,7 +2847,7 @@ const ACT = {
   theme: b => { S.settings.theme = b.dataset.t; commit(); }, dark: b => { S.settings.dark = b.dataset.v; commit(); }, toggle: b => { S.settings[b.dataset.k] = !S.settings[b.dataset.k]; commit(); }, ws: b => { S.settings.weekStart = +b.dataset.v; commit(); },
   backup, restore: () => $("#restoreFile").click(),
   sample: () => { if (S.setup && !confirm("Replace everything with sample data?")) return; S = window.HAVEN_SAMPLE(); S.setup = true; commit(); go("today"); toast("Sample data loaded – explore freely. Erase it in Settings when you're ready."); },
-  reset: () => { if (!confirm("Erase everything on this device? This can't be undone. (Download a backup first?)")) return; S = blank(); ob = { step: 0, bills: [] }; commit(); go("today"); },
+  reset: () => { if (!confirm("Erase everything on this device?" + (SYNC.linked ? " Your linked devices are cleared too – to clear only this one, unlink it in Settings first." : "") + " This can't be undone. (Download a backup first?)")) return; S = blank(); ob = { step: 0, bills: [] }; commit(); go("today"); },
   obTheme: b => { S.settings.theme = b.dataset.t; obCollect(); render(); }, obNext: () => { obCollect(); ob.step++; render(); }, obBack: () => { obCollect(); ob.step--; render(); }, obSkip: () => { if (ob.step === 2) { S.income = []; save(); } ob.step++; render(); },
   obBill: b => { obCollect(); const n = b.dataset.n, c = COMMON.find(x => x[0] === n); const i = ob.bills.findIndex(x => x.name === n); if (i >= 0) ob.bills.splice(i, 1); else ob.bills.push({ name: n, emoji: c[1], amount: c[2], day: 1 }); render(); },
   obDone: obFinish,
